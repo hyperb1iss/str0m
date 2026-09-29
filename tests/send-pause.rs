@@ -525,3 +525,36 @@ fn pause_stops_ssrc0_probes_bound_to_the_media() -> Result<(), RtcError> {
 
     Ok(())
 }
+
+/// The pause belongs to the media, so an ICE restart renegotiated by the remote keeps it.
+#[test]
+fn pause_survives_a_remote_ice_restart() -> Result<(), RtcError> {
+    let mut pair = setup_streaming()?;
+
+    let paused = pair.mark();
+    assert!(pair.l.direct_api().pause_send(pair.mid));
+    negotiate(&mut pair.r, &mut pair.l, |change| {
+        change.ice_restart(true);
+    });
+    pair.run(Duration::from_secs(3), None)?;
+
+    assert!(pair.l.media(pair.mid).unwrap().is_send_paused());
+    assert!(
+        pair.video_rtp_since(paused).is_empty(),
+        "no RTP on the video or RTX SSRCs across the restart"
+    );
+
+    let resumed = pair.mark();
+    assert!(pair.l.direct_api().resume_send(pair.mid));
+    pair.write(3_000, true, MARK_RESUMED)?;
+    pair.run(Duration::from_secs(1), None)?;
+    let after = pair.video_rtp_since(resumed);
+    assert!(
+        after
+            .first()
+            .is_some_and(|p| p.1 == pair.ssrc && has_run(&p.3, MARK_RESUMED)),
+        "the keyframe leads after the restart"
+    );
+
+    Ok(())
+}
