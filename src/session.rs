@@ -414,15 +414,19 @@ impl Session {
     // Use a negotiated PT and MID so browser transports can route the packet to
     // their receive-side congestion controller before discarding the empty payload.
     fn probe_media(&self) -> Option<(Mid, Pt)> {
-        self.medias.iter().find_map(|media| {
-            Self::probe_pt(media, &self.codec_config, None).map(|pt| (media.mid(), pt))
-        })
+        self.medias
+            .iter()
+            // A media resuming from pause_send carries no probe until its first packet.
+            .filter(|media| self.streams.send_gate_open(media.mid()))
+            .find_map(|media| {
+                Self::probe_pt(media, &self.codec_config, None).map(|pt| (media.mid(), pt))
+            })
     }
 
     // A regular padding source needs feedback for its actual payload type;
     // the SSRC 0 fallback can use any eligible payload type on this media.
     fn probe_pt(media: &Media, codecs: &CodecConfig, padding_pt: Option<Pt>) -> Option<Pt> {
-        if media.stopped() || !media.direction().is_sending() {
+        if media.stopped() || !media.direction().is_sending() || media.is_send_paused() {
             return None;
         }
         media
@@ -1375,7 +1379,27 @@ impl Session {
     fn has_active_outgoing_media(&self) -> bool {
         self.medias
             .iter()
-            .any(|m| m.direction().is_sending() && !m.disabled())
+            .any(|m| m.direction().is_sending() && !m.disabled() && !m.is_send_paused())
+    }
+
+    /// Pauses or resumes sending on a media. Returns `false` if the mid is unknown.
+    pub fn set_send_paused(&mut self, mid: Mid, paused: bool) -> bool {
+        let Some(media) = self.media_by_mid_mut(mid) else {
+            return false;
+        };
+
+        media.set_send_paused(paused);
+        self.streams.set_send_paused_tx(mid, paused);
+        if paused {
+            // SSRC 0 probe padding bound to this media stops with it.
+            self.streams.unbind_probe_media(mid);
+        }
+
+        // Padding follows active outgoing media, so recompute it at once
+        // rather than on the next TWCC report.
+        self.configure_pacer();
+
+        true
     }
 
     pub fn media_by_mid(&self, mid: Mid) -> Option<&Media> {

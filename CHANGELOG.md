@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add `DirectApi::pause_send` and `DirectApi::resume_send` to stop all RTP on a sending m-line, padding and retransmissions included, without renegotiation
   * Limit paced media bursts to about 63 kB #1058
 
 # 0.24.0

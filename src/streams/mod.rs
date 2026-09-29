@@ -479,6 +479,12 @@ impl Streams {
                 stream.create_sr_and_update(now, feedback);
             }
 
+            // A stream declared after its media was paused follows the pause here,
+            // before the pacer next sees its queue.
+            if let Some(media) = medias.iter().find(|m| m.mid() == mid) {
+                stream.set_send_paused(media.is_send_paused());
+            }
+
             // Finding the first (main) PT that also has RTX for the Media is expensive,
             // this closure is run only when needed.
             // The unwrap is okay because we cannot have StreamTx with a Mid without the corresponding Media.
@@ -698,6 +704,27 @@ impl Streams {
     pub(crate) fn reset_buffers_tx(&mut self, mid: Mid) {
         for s in self.streams_tx_by_mid(mid) {
             s.reset_buffers();
+        }
+    }
+
+    pub(crate) fn set_send_paused_tx(&mut self, mid: Mid, paused: bool) {
+        for s in self.streams_tx_by_mid(mid) {
+            s.set_send_paused(paused);
+        }
+    }
+
+    /// Whether no send stream of `mid` is paused or resuming.
+    pub(crate) fn send_gate_open(&self, mid: Mid) -> bool {
+        self.streams_tx
+            .values()
+            .filter(|s| s.mid() == mid)
+            .all(|s| s.send_gate_open())
+    }
+
+    /// Unbinds the SSRC 0 probe source if it is bound to `mid`.
+    pub(crate) fn unbind_probe_media(&mut self, mid: Mid) {
+        if self.probe_media.is_some_and(|(bound, _)| bound == mid) {
+            self.set_probe_media(None);
         }
     }
 

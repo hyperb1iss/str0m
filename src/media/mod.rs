@@ -150,6 +150,9 @@ pub struct Media {
     /// The payload queue cannot supply this after the event's packets have been sent.
     last_tele_end: Option<Instant>,
 
+    /// Set while sending is paused via [`DirectApi::pause_send`][crate::change::DirectApi::pause_send].
+    send_paused: bool,
+
     pub(crate) need_open_event: bool,
     pub(crate) need_changed_event: bool,
 
@@ -340,6 +343,21 @@ impl Media {
         self.stopped = true;
     }
 
+    /// Whether sending on this m-line is paused.
+    ///
+    /// See [`DirectApi::pause_send`][crate::change::DirectApi::pause_send].
+    pub fn is_send_paused(&self) -> bool {
+        self.send_paused
+    }
+
+    /// Pausing drops every sample written but not yet packetized.
+    pub(crate) fn set_send_paused(&mut self, paused: bool) {
+        self.send_paused = paused;
+        if paused {
+            self.to_payload.clear();
+        }
+    }
+
     pub(crate) fn simulcast(&self) -> Option<&SdpSimulcast> {
         self.simulcast.as_ref()
     }
@@ -526,6 +544,10 @@ impl Media {
     }
 
     fn set_to_payload(&mut self, to_payload: ToPayload) -> Result<(), RtcError> {
+        if self.send_paused {
+            return Err(RtcError::SendPaused(self.mid));
+        }
+
         let position = self.queue_position(&to_payload);
         self.to_payload.insert(position, to_payload);
         if self.to_payload.len() > MAX_PENDING_PAYLOADS {
@@ -577,6 +599,12 @@ impl Media {
         mtu: usize,
         red_distances: &[u32],
     ) -> Result<(), RtcError> {
+        if self.send_paused {
+            // Nothing is packetized while paused, see pause_send.
+            self.to_payload.clear();
+            return Ok(());
+        }
+
         let Some(front) = self.to_payload.front() else {
             return Ok(());
         };
@@ -724,6 +752,7 @@ impl Default for Media {
             depayloaders: HashMap::new(),
             to_payload: VecDeque::default(),
             last_tele_end: None,
+            send_paused: false,
             need_open_event: true,
             need_changed_event: false,
             red_send_enabled: true,
