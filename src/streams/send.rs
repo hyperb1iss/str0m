@@ -179,6 +179,21 @@ pub struct StreamTx {
 
     /// MTU warn threshold; used to cap spurious-padding RTX cache lookups.
     mtu_warn: usize,
+
+    /// Whether this stream may emit RTP, following the pause state of its media.
+    send_gate: SendGate,
+}
+
+/// The send gate of a [`StreamTx`], see [`DirectApi::pause_send`][crate::change::DirectApi::pause_send].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendGate {
+    /// Normal operation.
+    Open,
+    /// Nothing is sent on the SSRC or its RTX: no media, resends or padding.
+    Paused,
+    /// Media flows again, but padding stays off until the first regular
+    /// packet after the resume has been sent.
+    Resuming,
 }
 
 /// RTP packet data to enqueue on a direct RTP send stream.
@@ -334,6 +349,7 @@ impl StreamTx {
             remote_acked_ssrc: false,
             remote_acked_rtx_ssrc: false,
             mtu_warn,
+            send_gate: SendGate::Open,
         }
     }
 
@@ -431,6 +447,14 @@ impl StreamTx {
             vp8_patch,
         } = rtp;
 
+        if self.send_gate == SendGate::Paused {
+            debug!(
+                "Drop write_rtp for SSRC {} while sending is paused",
+                self.ssrc
+            );
+            return;
+        }
+
         let first_call = self.rtp_and_wallclock.is_none();
 
         if first_call && seq_no.roc() > 0 {
@@ -499,13 +523,20 @@ impl StreamTx {
         let remote_acked_ssrc = self.remote_acked_ssrc;
         let remote_acked_rtx_ssrc = self.remote_acked_rtx_ssrc;
 
+        if self.send_gate == SendGate::Paused {
+            return None;
+        }
+        let padding_allowed = self.send_gate == SendGate::Open;
+
         let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now) {
             (next, false)
         } else if let Some(next) = self.poll_packet_regular(now) {
             (next, false)
-        } else {
+        } else if padding_allowed {
             let next = self.poll_packet_padding(now)?;
             (next, true)
+        } else {
+            return None;
         };
 
         let pop_send_queue = next.kind == NextPacketKind::Regular;
@@ -691,6 +722,11 @@ impl StreamTx {
         let seq_no = next.seq_no;
         if next.kind == NextPacketKind::Regular {
             self.last_sent_seq_no = seq_no;
+
+            // The first media packet after a resume lifts the rest of the gate.
+            if self.send_gate == SendGate::Resuming {
+                self.send_gate = SendGate::Open;
+            }
         }
 
         self.last_used = now;
@@ -955,6 +991,11 @@ impl StreamTx {
         entries: impl Iterator<Item = NackEntry>,
         now: Instant,
     ) -> Option<()> {
+        if self.send_gate == SendGate::Paused {
+            // A paused stream answers no NACK.
+            return None;
+        }
+
         // Turning NackEntry into SeqNo we need to know a SeqNo "close by" to lengthen the 16 bit
         // sequence number into the 64 bit we have in SeqNo.
         let seq_no = self.rtx_cache.last_cached_seq_no()?;
@@ -1077,9 +1118,23 @@ impl StreamTx {
         // apply any pacing until we know what kind of content we are sending.
         let unpaced = self.unpaced.unwrap_or(true);
 
+        if self.send_gate == SendGate::Paused {
+            // A paused stream offers the pacer nothing to send and no padding queue,
+            // which also keeps probe clusters off it.
+            let snapshot = QueueSnapshot::default();
+            self.queue_info = Some(snapshot);
+
+            return QueueState {
+                midrid: self.midrid,
+                unpaced,
+                use_for_padding: false,
+                snapshot,
+            };
+        }
+
         // It's only possible to use this sender for padding if RTX is enabled and
-        // we know a PT to use for it.
-        let use_for_padding = self.padding_enabled();
+        // we know a PT to use for it. Padding stays off while resuming.
+        let use_for_padding = self.padding_enabled() && self.send_gate == SendGate::Open;
 
         let mut snapshot = self.send_queue.snapshot(now);
 
@@ -1151,7 +1206,7 @@ impl StreamTx {
     }
 
     pub(crate) fn generate_padding(&mut self, padding: usize) {
-        if !self.padding_enabled() {
+        if !self.padding_enabled() || self.send_gate != SendGate::Open {
             return;
         }
         self.padding += padding;
@@ -1209,6 +1264,23 @@ impl StreamTx {
         self.rtx_cache.clear();
         self.resends.clear();
         self.padding = 0;
+    }
+
+    /// Makes this stream follow the pause state of its media.
+    ///
+    /// Pausing clears the send queue, the RTX cache, pending resends and pending padding.
+    /// Resuming lets media through at once and padding after the first regular packet.
+    pub(crate) fn set_send_paused(&mut self, paused: bool) {
+        match (paused, self.send_gate) {
+            (true, SendGate::Paused) | (false, SendGate::Open | SendGate::Resuming) => {}
+            (true, _) => {
+                self.reset_buffers();
+                self.send_gate = SendGate::Paused;
+            }
+            (false, SendGate::Paused) => {
+                self.send_gate = SendGate::Resuming;
+            }
+        }
     }
 
     /// Reset this stream to use a new SSRC and optionally a new RTX SSRC.

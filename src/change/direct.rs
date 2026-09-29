@@ -237,6 +237,36 @@ impl<'a> DirectApi<'a> {
         self.rtc.session.remove_media(mid);
     }
 
+    /// Pause sending on the `Media` identified by `mid`.
+    ///
+    /// While paused, nothing is sent on the media's send streams (the SSRC and its RTX SSRC):
+    /// no media, no retransmissions and no padding, including bandwidth probe padding.
+    /// Pausing drops samples written but not yet packetized, clears the send queue,
+    /// the RTX cache and pending retransmissions and padding, and removes the media
+    /// from the active outgoing media the pacer pads for. Incoming NACKs are ignored.
+    /// RTCP, such as sender reports, and ICE continue, and the SDP is not changed.
+    ///
+    /// [`Writer::write`][crate::media::Writer::write] on a paused media returns
+    /// [`RtcError::SendPaused`], and RTP written with
+    /// [`StreamTx::write_rtp`][crate::rtp::StreamTx::write_rtp] is dropped.
+    ///
+    /// Returns `false` if there is no media for `mid`.
+    pub fn pause_send(&mut self, mid: Mid) -> bool {
+        self.rtc.session.set_send_paused(mid, true)
+    }
+
+    /// Resume sending on a `Media` paused with [`DirectApi::pause_send`].
+    ///
+    /// Media is sent again at once. Padding for the media stays off until the first
+    /// media packet written after the resume has been sent, so that packet is the
+    /// first one on the media's SSRCs. Since the receiver's decoder state is stale,
+    /// the first sample written after resuming should normally be a keyframe.
+    ///
+    /// Returns `false` if there is no media for `mid`.
+    pub fn resume_send(&mut self, mid: Mid) -> bool {
+        self.rtc.session.set_send_paused(mid, false)
+    }
+
     /// Allow incoming traffic from remote peer for the given SSRC.
     ///
     /// Can be called multiple times if the `rtx` is discovered later via RTP header extensions.

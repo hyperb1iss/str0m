@@ -1207,7 +1207,23 @@ impl Session {
     fn has_active_outgoing_media(&self) -> bool {
         self.medias
             .iter()
-            .any(|m| m.direction().is_sending() && !m.disabled())
+            .any(|m| m.direction().is_sending() && !m.disabled() && !m.is_send_paused())
+    }
+
+    /// Pauses or resumes sending on a media. Returns `false` if the mid is unknown.
+    pub fn set_send_paused(&mut self, mid: Mid, paused: bool) -> bool {
+        let Some(media) = self.media_by_mid_mut(mid) else {
+            return false;
+        };
+
+        media.set_send_paused(paused);
+        self.streams.set_send_paused_tx(mid, paused);
+
+        // Padding follows active outgoing media, so recompute it at once
+        // rather than on the next TWCC report.
+        self.configure_pacer();
+
+        true
     }
 
     pub fn media_by_mid(&self, mid: Mid) -> Option<&Media> {

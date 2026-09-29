@@ -55,6 +55,9 @@ pub enum RtcError {
     /// Direction does not allow receiving media data.
     NotReceivingDirection,
 
+    /// Sending on the media is paused with [`crate::change::DirectApi::pause_send`].
+    SendPaused(Mid),
+
     /// If MediaWriter.request_keyframe fails because we can't find an SSRC to use.
     NoReceiverSource(Option<Rid>),
 
@@ -106,6 +109,7 @@ impl fmt::Display for RtcError {
                 write!(f, "Direction does not allow sending: {}", dir)
             }
             RtcError::NotReceivingDirection => write!(f, "Direction does not allow receiving"),
+            RtcError::SendPaused(mid) => write!(f, "Sending is paused for mid {}", mid),
             RtcError::NoReceiverSource(rid) => write!(f, "No receiver source (rid: {:?})", rid),
             RtcError::FeedbackNotEnabled(kind) => {
                 write!(f, "Requested feedback is not enabled: {:?}", kind)

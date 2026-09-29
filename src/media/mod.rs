@@ -137,6 +137,9 @@ pub struct Media {
     /// Frames to payload. Should typically only be 0 or 1.
     to_payload: VecDeque<ToPayload>,
 
+    /// Set while sending is paused via [`DirectApi::pause_send`][crate::change::DirectApi::pause_send].
+    send_paused: bool,
+
     pub(crate) need_open_event: bool,
     pub(crate) need_changed_event: bool,
 
@@ -315,6 +318,21 @@ impl Media {
         self.stopped = true;
     }
 
+    /// Whether sending on this m-line is paused.
+    ///
+    /// See [`DirectApi::pause_send`][crate::change::DirectApi::pause_send].
+    pub fn is_send_paused(&self) -> bool {
+        self.send_paused
+    }
+
+    /// Pausing drops every sample written but not yet packetized.
+    pub(crate) fn set_send_paused(&mut self, paused: bool) {
+        self.send_paused = paused;
+        if paused {
+            self.to_payload.clear();
+        }
+    }
+
     pub(crate) fn simulcast(&self) -> Option<&SdpSimulcast> {
         self.simulcast.as_ref()
     }
@@ -462,6 +480,10 @@ impl Media {
     }
 
     fn set_to_payload(&mut self, to_payload: ToPayload) -> Result<(), RtcError> {
+        if self.send_paused {
+            return Err(RtcError::SendPaused(self.mid));
+        }
+
         if self.to_payload.len() > 100 {
             return Err(RtcError::WriteWithoutPoll);
         }
@@ -486,6 +508,12 @@ impl Media {
         vp9_mode: Vp9PacketizerMode,
         mtu: usize,
     ) -> Result<(), RtcError> {
+        if self.send_paused {
+            // Nothing is packetized while paused, see pause_send.
+            self.to_payload.clear();
+            return Ok(());
+        }
+
         let Some(to_payload) = self.to_payload.pop_front() else {
             return Ok(());
         };
@@ -609,6 +637,7 @@ impl Default for Media {
             payloaders: HashMap::new(),
             depayloaders: HashMap::new(),
             to_payload: VecDeque::default(),
+            send_paused: false,
             need_open_event: true,
             need_changed_event: false,
         }
