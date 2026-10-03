@@ -1,6 +1,15 @@
 use crate::rtp_::Bitrate;
 
-const PACING_FACTOR: f64 = 1.1;
+/// Pacing rate as a multiple of the bandwidth estimate.
+///
+/// The pacer smooths bursts, it does not enforce the estimate: the encoder's
+/// target does that. libwebrtc paces at 2.5 times the estimate
+/// (`kDefaultPaceMultiplier`) for the same reason. At 1.1 a realtime
+/// encoder's ordinary frame-size variance pushed the leaky bucket into debt,
+/// and every packet behind it, retransmissions included, waited for the
+/// debt to drain, which showed up as hundreds of milliseconds of silence on
+/// a video track with no loss at all.
+const PACING_FACTOR: f64 = 2.5;
 
 /// Target padding rate when media is active. This maintains NAT bindings, RTX state,
 /// and allows ALR periodic probes to discover higher bandwidth.
