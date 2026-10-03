@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use super::Pacer;
 use super::PaddingRequest;
 use super::QueueState;
+use super::queue::QueuePriority;
 use crate::Reason;
 use crate::bwe_::ProbeClusterConfig;
 use crate::bwe_::ProbeClusterState;
@@ -294,9 +295,15 @@ impl LeakyBucketPacer {
                     // During probe: use absolute time directly from probe state
                     (probe.next_probe_time(), PacerReason::Probe1)
                 } else {
-                    // Normal pacing: use relative offset based on debt
+                    // Normal pacing: use relative offset based on debt. A queue
+                    // holding retransmissions is not made to wait out the debt:
+                    // the receiver asked for those packets because its jitter
+                    // buffer is stalled, and it gives up and requests a key frame
+                    // after a handful of unanswered NACKs. They still accrue debt
+                    // and the RTX ratio cap still bounds their volume.
                     let drain_debt_time = self.media_debt / self.adjusted_bitrate;
-                    let next_send_offset = if drain_debt_time > PACING {
+                    let retransmitting = queue.snapshot.priority == QueuePriority::Retransmission;
+                    let next_send_offset = if drain_debt_time > PACING && !retransmitting {
                         // If we have incurred too much debt we need to wait to let it clear out before sending
                         // again.
                         drain_debt_time
@@ -754,6 +761,76 @@ mod test {
         assert!(
             pacer.poll_queue().is_none(),
             "Fifth packet shoud not be relaesed because there's too much debt"
+        );
+    }
+
+    #[test]
+    fn retransmissions_are_not_held_behind_media_debt() {
+        let now = Instant::now();
+        let mut queue = Queue::default();
+        // 2,000 bits per second, 10 bytes per pacing interval(40ms)
+        let mut pacer = LeakyBucketPacer::new((10 * 200).into());
+        handle_timeout_noisy(&mut pacer, &mut queue, now + duration_ms(1));
+
+        enqueue_packet_noisy(
+            &mut pacer,
+            &mut queue,
+            1,
+            22,
+            PacketKind::Video,
+            now + duration_ms(21),
+        );
+        assert_poll_success(
+            &mut pacer,
+            &mut queue,
+            now + duration_ms(21),
+            "First packet should be released because we have no debt",
+            |packet| {
+                assert_eq!(packet.header.sequence_number, 1);
+            },
+        );
+        handle_timeout_noisy(&mut pacer, &mut queue, now + duration_ms(41));
+
+        enqueue_packet_noisy(
+            &mut pacer,
+            &mut queue,
+            2,
+            8,
+            PacketKind::Video,
+            now + duration_ms(66),
+        );
+        assert!(
+            pacer.poll_queue().is_none(),
+            "Media should wait while the debt exceeds the pacing window"
+        );
+
+        // The receiver asks for a retransmission: the same queue now holds one.
+        queue.set_priority(PacketKind::Video, QueuePriority::Retransmission);
+        handle_timeout_noisy(&mut pacer, &mut queue, now + duration_ms(66));
+
+        assert_poll_success(
+            &mut pacer,
+            &mut queue,
+            now + duration_ms(66),
+            "A retransmission is released at once despite the debt",
+            |packet| {
+                assert_eq!(packet.header.sequence_number, 2);
+            },
+        );
+
+        // With the retransmission gone, media is paced again.
+        queue.set_priority(PacketKind::Video, QueuePriority::Media);
+        enqueue_packet_noisy(
+            &mut pacer,
+            &mut queue,
+            3,
+            40,
+            PacketKind::Video,
+            now + duration_ms(67),
+        );
+        assert!(
+            pacer.poll_queue().is_none(),
+            "Media behind the retransmission still waits out the debt"
         );
     }
 
@@ -1238,6 +1315,10 @@ mod test {
 
                     pad_size = pad_size.saturating_sub(final_packet_size.as_bytes_usize());
                 }
+            }
+
+            pub(super) fn set_priority(&mut self, kind: PacketKind, priority: QueuePriority) {
+                self.queue_for_kind_mut(kind).priority = priority;
             }
 
             fn queue_for_kind_mut(&mut self, kind: PacketKind) -> &mut Inner {

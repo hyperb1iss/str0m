@@ -1177,7 +1177,7 @@ impl StreamTx {
                 snapshot
             });
         snapshot.created_at = now;
-        snapshot.update_priority(QueuePriority::Media);
+        snapshot.update_priority(QueuePriority::Retransmission);
 
         Some(snapshot)
     }

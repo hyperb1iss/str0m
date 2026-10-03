@@ -30,13 +30,17 @@ pub struct QueueSnapshot {
 /// When sorted, higher priority sorts first.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QueuePriority {
-    // Highest, priority for a queue that contains media.
-    Media = 0,
+    // Highest, priority for a queue holding retransmissions a receiver
+    // asked for. The receiver's jitter buffer is stalled until they land,
+    // and a receiver that waits too long gives up and requests a key frame.
+    Retransmission = 0,
+    // Priority for a queue that contains media.
+    Media = 1,
     // Priority for a queue that only contains padding.
-    Padding = 1,
+    Padding = 2,
     // Priority for an empty queue.
     #[default]
-    Empty = 2,
+    Empty = 3,
 }
 
 impl QueueSnapshot {
