@@ -538,6 +538,7 @@ where
     let rtcpmux = attribute_line_flag("rtcp-mux").map(|_| MediaAttribute::RtcpMux);
     let rtcpmuxonly = attribute_line_flag("rtcp-mux-only").map(|_| MediaAttribute::RtcpMuxOnly);
     let rtcprsize = attribute_line_flag("rtcp-rsize").map(|_| MediaAttribute::RtcpRsize);
+    let rtcpxr = attribute_line("rtcp-xr", any_value()).map(MediaAttribute::RtcpXr);
 
     // a=candidate
     let cand = candidate_attribute().map(MediaAttribute::Candidate);
@@ -778,6 +779,7 @@ where
             attempt(rtcpmux),
             attempt(rtcpmuxonly),
             attempt(rtcprsize),
+            attempt(rtcpxr),
             attempt(cand),
             attempt(endof),
             attempt(rtpmap),
