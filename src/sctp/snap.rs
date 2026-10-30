@@ -13,13 +13,15 @@ use super::{LOCAL_MAX_MESSAGE_SIZE, SctpError as Error};
 ///
 /// For WebRTC, we never want to give up retransmitting init and data packets.
 /// The connectivity is in ICE, and SCTP should not give up until ICE gives up.
-pub(super) fn webrtc_transport_config() -> Arc<TransportConfig> {
-    Arc::new(
-        TransportConfig::default()
-            .with_max_init_retransmits(None)
-            .with_max_data_retransmits(None)
-            .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE),
-    )
+pub(super) fn webrtc_transport_config() -> TransportConfig {
+    // Match Chromium's WebRTC initial/minimum RTO while keeping the SCTP
+    // estimator, maximum timeout and exponential backoff unchanged.
+    TransportConfig::default()
+        .with_rto_initial_ms(500)
+        .with_rto_min_ms(400)
+        .with_max_init_retransmits(None)
+        .with_max_data_retransmits(None)
+        .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE)
 }
 
 /// Out-of-band SCTP INIT data for SNAP negotiation.
@@ -61,7 +63,7 @@ pub struct SctpInitData {
 impl Default for SctpInitData {
     fn default() -> Self {
         SctpInitData {
-            transport: webrtc_transport_config(),
+            transport: Arc::new(webrtc_transport_config()),
             local_init: None,
             remote_init: None,
         }

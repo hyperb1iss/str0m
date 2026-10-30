@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use sctp_proto::{Association, AssociationHandle, DatagramEvent};
 use sctp_proto::{Endpoint, EndpointConfig, Stream, StreamEvent, Transmit};
-use sctp_proto::{Event, Payload, PayloadProtocolIdentifier, ServerConfig, TransportConfig};
+use sctp_proto::{Event, Payload, PayloadProtocolIdentifier, ServerConfig};
 
 use snap::{b64_encode, webrtc_transport_config};
 
 pub use sctp_proto::Error as ProtoError;
 use sctp_proto::ReliabilityType;
+
+#[cfg(test)]
+mod rto_test;
 
 mod snap;
 pub use snap::SctpInitData;
@@ -294,7 +297,7 @@ impl RtcSctp {
         #[cfg(test)]
         let max_payload_size = max_payload;
         let mut server_config = ServerConfig::default();
-        server_config.transport = webrtc_transport_config();
+        server_config.transport = Arc::new(webrtc_transport_config());
         let endpoint = Endpoint::new(Arc::new(config), Some(Arc::new(server_config)));
         let fake_addr = "1.1.1.1:5000".parse().unwrap();
 
@@ -389,11 +392,7 @@ impl RtcSctp {
             let mut config = SctpInitData::default().into_client_config();
 
             config.transport = Arc::new(
-                TransportConfig::default()
-                    .with_max_init_retransmits(None)
-                    .with_max_data_retransmits(None)
-                    .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE)
-                    .with_max_send_message_size(self.remote_max_message_size),
+                webrtc_transport_config().with_max_send_message_size(self.remote_max_message_size),
             );
 
             debug!("New local association (out-of-band: false)");
