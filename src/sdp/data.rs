@@ -869,6 +869,8 @@ pub enum MediaAttribute {
     RtcpMuxOnly, // only in offer, answer with a=rtcp-mux
     // reduced size rtcp. remove this if not supported.
     RtcpRsize,
+    /// RTCP XR capabilities (RFC 3611 section 5).
+    RtcpXr(String),
     Candidate(Candidate),
     EndOfCandidates,
     RtpMap {
@@ -1443,6 +1445,7 @@ impl fmt::Display for MediaAttribute {
             RtcpMux => write!(f, "a=rtcp-mux\r\n")?,
             RtcpMuxOnly => write!(f, "a=rtcp-mux-only\r\n")?,
             RtcpRsize => write!(f, "a=rtcp-rsize\r\n")?,
+            RtcpXr(value) => write!(f, "a=rtcp-xr:{value}\r\n")?,
             Candidate(c) => write!(f, "a={}\r\n", c.to_sdp_string())?,
             EndOfCandidates => write!(f, "a=end-of-candidates\r\n")?,
             RtpMap { pt, value: c } => {

@@ -1506,6 +1506,13 @@ impl AsSdpMediaLine for Media {
         attrs.push(MediaAttribute::Msid(self.msid().clone()));
         attrs.push(MediaAttribute::RtcpMux);
 
+        // DLRR responses accompany Sender Reports. Advertise only the sender
+        // role so a receive-only peer can initiate RTT measurement (RFC 3611
+        // section 5.2) without promising responses from an inactive sender.
+        if self.direction().is_sending() {
+            attrs.push(MediaAttribute::RtcpXr("rcvr-rtt=sender".into()));
+        }
+
         // The effective params start from the Session::codec_config to retain the
         // user's configured preferred order, however they are narrowed only include
         // those the remote peer wants.
