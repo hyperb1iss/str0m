@@ -226,15 +226,19 @@ fn webrtc_rto_sampled_loss_recovers_ordered_messages_once() {
                 "snap={snap} sender={from}"
             );
             assert_eq!(pair.attempts.len(), 3);
+            // The delivered later message exposes the hole. RACK resends it
+            // one RTT plus a quarter-SRTT reordering window after the
+            // original, well before T3-rtx.
             assert_eq!(
                 pair.attempts[1] - pair.attempts[0],
+                Duration::from_millis(13)
+            );
+            // With that resend lost too, T3-rtx fires at the minimum RTO.
+            assert_eq!(
+                pair.attempts[2] - pair.attempts[0],
                 Duration::from_millis(400)
             );
-            assert_eq!(
-                pair.attempts[2] - pair.attempts[1],
-                Duration::from_millis(800)
-            );
-            assert_eq!(pair.timeouts(from), 2);
+            assert_eq!(pair.timeouts(from), 1);
             pair.advance(4000);
             assert_eq!(pair.received[1 - from].len(), 2);
         }

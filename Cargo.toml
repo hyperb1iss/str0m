@@ -53,7 +53,7 @@ _str0m_test = { path = "crates/_str0m_test" }
 # Core dependencies
 tracing = "0.1.37"
 fastrand = "2.0.1"
-sctp-proto = { version = "0.10.5", git = "https://github.com/hyperb1iss/sctp-proto", rev = "801ebdad869ad67c030cad2f651cd292e14d5ba0" }
+sctp-proto = { version = "0.10.5", git = "https://github.com/hyperb1iss/sctp-proto", rev = "504f6b418234eef8533b24f8c1cb9cfc2ea50b18" }
 combine = "4.6.6"
 subtle = "2.0.0"
 arrayvec = "0.7.6"
