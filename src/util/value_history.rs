@@ -35,6 +35,18 @@ where
         self.history.push_back((t, v));
     }
 
+    /// Adds a timed value and drops values older than `t - max_time`, so the
+    /// history stays bounded even when nothing reads the sum.
+    pub fn push_recent(&mut self, t: Instant, v: T) {
+        self.push(t, v);
+        self.purge_old(t);
+    }
+
+    #[cfg(test)]
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
     /// Returns the sum of all values in the history up to max_time. Might
     /// return stale value unless [`ValueHistory::purge_old`] is called before.
     pub fn sum(&self) -> T {

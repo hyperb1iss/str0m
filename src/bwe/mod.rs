@@ -269,7 +269,8 @@ impl SendSideBandwidthEstimator {
             .data_channel_acked_at
             .map_or(delivery.acked_at, |t| t.max(delivery.acked_at));
         self.data_channel_acked_at = Some(acked_at);
-        self.data_channel_acked.push(acked_at, delivery.size);
+        // Without TWCC feedback nothing else purges the window.
+        self.data_channel_acked.push_recent(acked_at, delivery.size);
     }
 
     /// Data channel throughput acknowledged over the sustained window.
@@ -813,6 +814,26 @@ mod test {
         fed.run(Duration::from_secs(8));
         assert_eq!(fed.state(), LossControllerState::DelayBased);
         assert!(fed.estimate() >= Bitrate::kbps(2400), "{}", fed.estimate());
+    }
+
+    #[test]
+    fn data_channel_history_stays_bounded_without_transport_feedback() {
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::kbps(2500));
+        let start = Instant::now();
+        // Ten seconds of data channel deliveries at 100 per second, with no
+        // TWCC report to drive `update`.
+        for i in 0..1000u32 {
+            let sent = start + Duration::from_millis(10 * i as u64);
+            bwe.on_data_channel_delivery(DataChannelDelivery {
+                first_sent: sent,
+                last_sent: sent,
+                acked_at: sent + 2 * ONE_WAY,
+                size: PACKET.into(),
+                lost_transmissions: 0,
+            });
+        }
+        assert!(bwe.data_channel_acked.history_len() <= 101);
+        assert!(bwe.data_channel_samples.len() <= MAX_PENDING_DATA_CHANNEL_SAMPLES);
     }
 
     #[test]

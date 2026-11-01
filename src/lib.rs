@@ -1817,8 +1817,11 @@ impl Rtc {
                 Some(datagram) => {
                     // Once connected, DTLS only carries data channels.
                     if self.dtls_connected {
-                        self.data_channel_bytes_tx
-                            .push(self.last_now, datagram.len() as u64);
+                        record_data_channel_datagram(
+                            &mut self.data_channel_bytes_tx,
+                            self.last_now,
+                            datagram.len(),
+                        );
                     }
                     Some(datagram)
                 }
@@ -2238,11 +2241,30 @@ pub fn init_crypto_default() {
     crate::crypto::from_feature_flags().install_process_default();
 }
 
+/// Count a data channel datagram toward the one second send rate window.
+fn record_data_channel_datagram(history: &mut ValueHistory<u64>, now: Instant, len: usize) {
+    history.push_recent(now, len as u64);
+}
+
 #[cfg(test)]
 mod test {
     use std::panic::UnwindSafe;
+    use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn data_channel_send_history_stays_bounded_without_a_reader() {
+        let start = Instant::now();
+        let mut rtc = Rtc::new(start);
+        // Ten seconds at 100 datagrams per second, never asking for the rate.
+        for i in 0..1000u64 {
+            rtc.last_now = start + Duration::from_millis(10 * i);
+            record_data_channel_datagram(&mut rtc.data_channel_bytes_tx, rtc.last_now, 1000);
+        }
+        assert!(rtc.data_channel_bytes_tx.history_len() <= 101);
+        assert_eq!(rtc.data_channel_bitrate(), Bitrate::kbps(808));
+    }
 
     #[test]
     fn rtc_is_send() {
