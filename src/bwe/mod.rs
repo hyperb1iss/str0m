@@ -61,6 +61,11 @@ const MAX_PENDING_DATA_CHANNEL_SAMPLES: usize = 4096;
 /// The window over which acknowledged data channel bytes count as sustained.
 const DATA_CHANNEL_ACKED_WINDOW: Duration = Duration::from_secs(1);
 
+/// How long after the last lost packet a probe result counts as following
+/// loss. About eight loss controller observations of 250 ms: a policer that
+/// keeps dropping bursts stays inside it, restored capacity soon leaves it.
+const RECENT_LOSS_WINDOW: Duration = Duration::from_secs(2);
+
 /// A data channel DATA chunk acknowledged by the peer's SCTP stack.
 ///
 /// TWCC covers RTP only, so these are the only loss signal for data channel
@@ -203,6 +208,8 @@ struct SendSideBandwidthEstimator {
     data_channel_acked: ValueHistory<DataSize>,
     /// Latest data channel acknowledgement time pushed into the history.
     data_channel_acked_at: Option<Instant>,
+    /// When feedback last reported a lost packet, RTP or data channel.
+    last_loss_at: Option<Instant>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -229,6 +236,7 @@ impl SendSideBandwidthEstimator {
             data_channel_samples: Vec::new(),
             data_channel_acked: ValueHistory::default(),
             data_channel_acked_at: None,
+            last_loss_at: None,
         }
     }
 
@@ -279,6 +287,36 @@ impl SendSideBandwidthEstimator {
         }
     }
 
+    /// While loss limits the estimate, a probe that succeeds may only show
+    /// that a burst fit through a policer's token bucket, which builds no
+    /// queue for the delay detector to see. Cap the probe at the sustained
+    /// acknowledged throughput, and never below the current estimate.
+    ///
+    /// Both conditions must hold. Inherent random loss keeps the loss
+    /// controller delay based, so probes on a merely lossy link still find
+    /// capacity, and once losses stop for a while, probes recover the
+    /// estimate after the capacity comes back.
+    fn cap_probe_after_loss(
+        &self,
+        probe: Bitrate,
+        acked: Option<Bitrate>,
+        now: Instant,
+    ) -> Bitrate {
+        let loss_limited =
+            self.loss_controller.loss_based_result().state != LossControllerState::DelayBased;
+        let recent_loss = self
+            .last_loss_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= RECENT_LOSS_WINDOW);
+        if !loss_limited || !recent_loss {
+            return probe;
+        }
+        let Some(acked) = acked else {
+            return probe;
+        };
+        let floor = self.last_estimate().unwrap_or(acked);
+        probe.min(acked.max(floor))
+    }
+
     /// Whether the delay-based detector currently signals overuse.
     ///
     /// This is useful for gating behaviors (like padding/probing) that would otherwise
@@ -301,19 +339,11 @@ impl SendSideBandwidthEstimator {
 
         let send_records: Vec<_> = records.collect();
 
-        // Feed records to probe estimator for analysis and process any new probe results
-        let mut latest_probe_result = None;
-        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
-            latest_probe_result = Some(bitrate);
-
-            // Update link capacity estimator for every successful ALR probe, not just the latest.
-            // The estimator internally takes the max of all probe results, building up knowledge
-            // of proven link capacity. This differs from the delay controller, which only receives
-            // the latest probe result (matching WebRTC's FetchAndResetLastEstimatedBitrate behavior).
-            if config.is_alr_probe() {
-                self.link_capacity_estimator.update_from_probe(bitrate, now);
-            }
-        }
+        // Feed records to probe estimator for analysis
+        let probe_results: Vec<_> = self
+            .probe_estimator
+            .update(send_records.iter().copied())
+            .collect();
 
         let mut acked_packets = vec![];
 
@@ -338,6 +368,25 @@ impl SendSideBandwidthEstimator {
 
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
         let total_acked_bitrate = self.total_acked_bitrate(acked_bitrate, now);
+        let feedback_lost = send_records.iter().any(|r| r.remote_recv_time().is_none())
+            || self.data_channel_samples.iter().any(|s| s.lost);
+        if feedback_lost {
+            self.last_loss_at = Some(now);
+        }
+
+        let mut latest_probe_result = None;
+        for (config, bitrate) in probe_results {
+            let bitrate = self.cap_probe_after_loss(bitrate, total_acked_bitrate, now);
+            latest_probe_result = Some(bitrate);
+
+            // Update link capacity estimator for every successful ALR probe, not just the latest.
+            // The estimator internally takes the max of all probe results, building up knowledge
+            // of proven link capacity. This differs from the delay controller, which only receives
+            // the latest probe result (matching WebRTC's FetchAndResetLastEstimatedBitrate behavior).
+            if config.is_alr_probe() {
+                self.link_capacity_estimator.update_from_probe(bitrate, now);
+            }
+        }
 
         // Use the latest probe result from this update, if any
         let probe_result = latest_probe_result;
@@ -618,6 +667,7 @@ impl fmt::Display for BandwidthUsage {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::bwe_::probe::ProbeKind;
     use crate::rtp_::TwccPacketId;
 
     const ONE_WAY: Duration = Duration::from_millis(20);
@@ -706,6 +756,30 @@ mod test {
         fn estimate(&self) -> Bitrate {
             self.bwe.last_estimate().expect("an estimate")
         }
+
+        /// A probe cluster that the path delivers at 4.8 Mbps.
+        fn successful_probe(&mut self) {
+            let cluster = 9.into();
+            let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(5), ProbeKind::Stagnant);
+            assert!(self.bwe.start_probe(config, self.now));
+            let start = self.now;
+            let records: Vec<_> = (0..10u64)
+                .map(|i| {
+                    let sent = start + Duration::from_millis(2 * i);
+                    let record = TwccSendRecord::test_new(
+                        TwccPacketId::with_cluster(self.seq, cluster),
+                        sent,
+                        1200,
+                        sent + 2 * ONE_WAY,
+                        Some(sent + ONE_WAY),
+                    );
+                    self.seq += 1;
+                    record
+                })
+                .collect();
+            self.now += 2 * ONE_WAY + Duration::from_millis(20);
+            self.bwe.update(records.iter(), self.now);
+        }
     }
 
     #[test]
@@ -767,6 +841,58 @@ mod test {
             fed.bwe
                 .data_channel_acked_bitrate(now + DATA_CHANNEL_ACKED_WINDOW * 2),
             Bitrate::ZERO
+        );
+    }
+
+    #[test]
+    fn probe_after_loss_is_capped_at_sustained_throughput() {
+        let mut fed = Sim::new(true, Some(2));
+        fed.run(Duration::from_secs(8));
+        assert_ne!(fed.state(), LossControllerState::DelayBased);
+        let before = fed.estimate();
+        let acked = fed
+            .bwe
+            .total_acked_bitrate(fed.bwe.acked_bitrate_estimator.current_estimate(), fed.now)
+            .unwrap();
+        fed.successful_probe();
+        let cap = acked.max(before);
+        assert!(
+            fed.bwe.delay_controller.last_estimate().unwrap() <= cap,
+            "the probe must not lift the delay estimate past {cap}"
+        );
+        assert!(fed.estimate() <= cap, "{} > {cap}", fed.estimate());
+        assert!(fed.estimate() >= before.min(acked));
+    }
+
+    #[test]
+    fn probe_recovers_once_losses_stop() {
+        let mut fed = Sim::new(true, Some(2));
+        fed.run(Duration::from_secs(8));
+        assert_eq!(fed.state(), LossControllerState::Decreasing);
+
+        // The path stops dropping. Recovery is still loss limited, but after
+        // the recent-loss window a probe may lift the estimate again.
+        fed.loss_every = None;
+        fed.run(RECENT_LOSS_WINDOW + FEEDBACK_INTERVAL);
+        assert_ne!(fed.state(), LossControllerState::DelayBased);
+        fed.successful_probe();
+        assert!(
+            fed.bwe.delay_controller.last_estimate().unwrap() >= Bitrate::kbps(4000),
+            "{:?}",
+            fed.bwe.delay_controller.last_estimate()
+        );
+    }
+
+    #[test]
+    fn probe_without_loss_still_discovers_capacity() {
+        let mut fed = Sim::new(true, None);
+        fed.run(Duration::from_secs(8));
+        assert_eq!(fed.state(), LossControllerState::DelayBased);
+        fed.successful_probe();
+        assert!(
+            fed.estimate() >= Bitrate::kbps(4000),
+            "a probe on a lossless path raises the estimate: {}",
+            fed.estimate()
         );
     }
 }
