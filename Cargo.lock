@@ -1746,7 +1746,7 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.10.5"
-source = "git+https://github.com/hyperb1iss/sctp-proto?rev=504f6b418234eef8533b24f8c1cb9cfc2ea50b18#504f6b418234eef8533b24f8c1cb9cfc2ea50b18"
+source = "git+https://github.com/hyperb1iss/sctp-proto?rev=2a22181c96a45ecfad1623b4e9fc07029cc7f4db#2a22181c96a45ecfad1623b4e9fc07029cc7f4db"
 dependencies = [
  "bytes",
  "crc",
