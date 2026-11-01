@@ -1700,6 +1700,12 @@ impl Rtc {
             return Ok(Output::Event(Event::Connected));
         }
 
+        // TWCC covers RTP only. Data channel acknowledgements tell bandwidth
+        // estimation about losses on the same path.
+        while let Some(delivery) = self.sctp.poll_data_delivery() {
+            self.session.on_data_channel_delivery(delivery);
+        }
+
         while let Some(e) = self.sctp.poll() {
             match e {
                 SctpEvent::Transmit { mut packets } => {

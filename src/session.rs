@@ -1151,6 +1151,13 @@ impl Session {
         snapshot.ingress_loss_fraction = self.twcc_rx_register.loss();
     }
 
+    /// Feed a data channel delivery to bandwidth estimation, when enabled.
+    pub fn on_data_channel_delivery(&mut self, delivery: crate::bwe_::DataChannelDelivery) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.on_data_channel_delivery(delivery);
+        }
+    }
+
     pub fn set_bwe_desired_bitrate(&mut self, desired_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.set_desired_bitrate(desired_bitrate);

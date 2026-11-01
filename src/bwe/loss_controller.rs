@@ -403,6 +403,11 @@ impl LossController {
         self.min_bitrate = min_bitrate;
     }
 
+    #[cfg(test)]
+    pub fn acknowledged_bitrate(&self) -> Bitrate {
+        self.acknowledged_bitrate
+    }
+
     pub fn loss_based_result(&self) -> LossBasedBweResult {
         let mut result = LossBasedBweResult {
             bandwidth_estimate: self.current_estimate.loss_limited_bandwidth.as_valid(),

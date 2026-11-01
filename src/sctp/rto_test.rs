@@ -1,6 +1,7 @@
 //! Virtual association tests exercise the transport config used by each role.
 
 use super::*;
+use crate::rtp_::DataSize;
 use str0m_proto::DATAGRAM_MTU_TARGET;
 
 struct Datagram {
@@ -288,6 +289,42 @@ fn webrtc_rto_path_delay_increase_recovers() {
                 "snap={snap} sender={from}: repeated lossless T3 timeouts: {}",
                 pair.timeouts(from)
             );
+        }
+    }
+}
+
+#[test]
+fn data_delivery_reports_count_lost_transmissions() {
+    for snap in [false, true] {
+        for from in 0..2 {
+            let mut pair = Pair::new(snap, 5);
+            pair.warm_up(from);
+            while pair.peers[from].poll_data_delivery().is_some() {}
+
+            pair.drop_sender = from;
+            pair.drops_left = 1;
+            let start = pair.now;
+            pair.send(from, &[7; 300]);
+            pair.advance(1000);
+            assert_eq!(pair.received[1 - from], [vec![7; 300]]);
+            assert_eq!(pair.attempts.len(), 2);
+
+            let delivery = pair.peers[from]
+                .poll_data_delivery()
+                .expect("the peer acknowledged the chunk");
+            assert_eq!(delivery.size, DataSize::bytes(300));
+            assert_eq!(delivery.lost_transmissions, 1, "snap={snap} sender={from}");
+            assert_eq!(delivery.first_sent, pair.attempts[0]);
+            assert_eq!(delivery.last_sent, pair.attempts[1]);
+            assert!(delivery.first_sent >= start);
+            assert!(delivery.acked_at > delivery.last_sent);
+            assert!(pair.peers[from].poll_data_delivery().is_none());
+
+            pair.send(from, b"clean");
+            pair.advance(1000);
+            let delivery = pair.peers[from].poll_data_delivery().unwrap();
+            assert_eq!(delivery.lost_transmissions, 0);
+            assert_eq!(delivery.size, DataSize::bytes(5));
         }
     }
 }

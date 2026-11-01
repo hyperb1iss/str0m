@@ -22,6 +22,9 @@ pub(super) fn webrtc_transport_config() -> TransportConfig {
         .with_max_init_retransmits(None)
         .with_max_data_retransmits(None)
         .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE)
+        // Data channels share the path with media, so the bandwidth
+        // estimator learns their losses from SCTP acknowledgements.
+        .with_data_delivery_reports(true)
 }
 
 /// Out-of-band SCTP INIT data for SNAP negotiation.

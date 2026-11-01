@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::Reason;
 use crate::rtp_::{Bitrate, DataSize, TwccClusterId, TwccSendRecord, TwccSeq};
 use crate::util::Soonest;
+use crate::util::value_history::ValueHistory;
 
 mod acked_bitrate_estimator;
 mod alr_detector;
@@ -36,7 +37,7 @@ use acked_bitrate_estimator::AckedBitrateEstimator;
 use alr_detector::AlrDetector;
 use delay::DelayController;
 use link_capacity_estimator::LinkCapacityEstimator;
-use loss_controller::{LossController, LossControllerState};
+use loss_controller::{LossController, LossControllerState, PacketResult};
 use macros::log_loss;
 use smoother::EstimateSmoother;
 
@@ -52,6 +53,63 @@ pub(crate) use probe::ProbeClusterConfig;
 const INITIAL_BITRATE_WINDOW: Duration = Duration::from_millis(500);
 const BITRATE_WINDOW: Duration = Duration::from_millis(150);
 const STARTUP_PHASE: Duration = Duration::from_secs(2);
+
+/// Data channel transmissions held for the next transport feedback report.
+/// Media keeps reports flowing, so this only bounds a session without them.
+const MAX_PENDING_DATA_CHANNEL_SAMPLES: usize = 4096;
+
+/// The window over which acknowledged data channel bytes count as sustained.
+const DATA_CHANNEL_ACKED_WINDOW: Duration = Duration::from_secs(1);
+
+/// A data channel DATA chunk acknowledged by the peer's SCTP stack.
+///
+/// TWCC covers RTP only, so these are the only loss signal for data channel
+/// traffic sharing the path with media.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DataChannelDelivery {
+    /// When the chunk was first sent.
+    pub first_sent: Instant,
+    /// When the chunk was last sent, the transmission that arrived.
+    pub last_sent: Instant,
+    /// When the acknowledgement arrived.
+    pub acked_at: Instant,
+    /// User data carried by each transmission.
+    pub size: DataSize,
+    /// Transmissions that did not reach the peer.
+    pub lost_transmissions: u32,
+}
+
+/// One transmission and whether it arrived, from TWCC or SCTP.
+#[derive(Debug, Clone, Copy)]
+struct LossSample {
+    send_time: Instant,
+    size: DataSize,
+    lost: bool,
+}
+
+impl PacketResult for LossSample {
+    fn local_send_time(&self) -> Instant {
+        self.send_time
+    }
+
+    fn size(&self) -> DataSize {
+        self.size
+    }
+
+    fn lost(&self) -> bool {
+        self.lost
+    }
+}
+
+impl From<&TwccSendRecord> for LossSample {
+    fn from(record: &TwccSendRecord) -> Self {
+        LossSample {
+            send_time: record.local_send_time(),
+            size: record.size().into(),
+            lost: record.remote_recv_time().is_none(),
+        }
+    }
+}
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
@@ -116,6 +174,10 @@ impl Bwe {
         }
     }
 
+    pub fn on_data_channel_delivery(&mut self, delivery: DataChannelDelivery) {
+        self.bwe.on_data_channel_delivery(delivery);
+    }
+
     pub fn is_overusing(&self) -> bool {
         self.bwe.is_overusing()
     }
@@ -135,6 +197,12 @@ struct SendSideBandwidthEstimator {
     alr_detector: AlrDetector,
     link_capacity_estimator: LinkCapacityEstimator,
     last_updated_estimate: Option<Bitrate>,
+    /// Data channel transmissions resolved since the last TWCC report.
+    data_channel_samples: Vec<LossSample>,
+    /// Data channel bytes acknowledged within the sustained window.
+    data_channel_acked: ValueHistory<DataSize>,
+    /// Latest data channel acknowledgement time pushed into the history.
+    data_channel_acked_at: Option<Instant>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -158,6 +226,56 @@ impl SendSideBandwidthEstimator {
             alr_detector,
             link_capacity_estimator: LinkCapacityEstimator::new(),
             last_updated_estimate: None,
+            data_channel_samples: Vec::new(),
+            data_channel_acked: ValueHistory::default(),
+            data_channel_acked_at: None,
+        }
+    }
+
+    /// Record a data channel delivery for the loss and throughput estimates.
+    ///
+    /// Each transmission counts as one packet: the lost ones at the first
+    /// send time, which SCTP knows exactly for the first loss, and the one
+    /// that arrived at the last send time.
+    pub fn on_data_channel_delivery(&mut self, delivery: DataChannelDelivery) {
+        let lost = (0..delivery.lost_transmissions).map(|_| LossSample {
+            send_time: delivery.first_sent,
+            size: delivery.size,
+            lost: true,
+        });
+        let arrived = LossSample {
+            send_time: delivery.last_sent,
+            size: delivery.size,
+            lost: false,
+        };
+        self.data_channel_samples
+            .extend(lost.chain(std::iter::once(arrived)));
+        let excess = self
+            .data_channel_samples
+            .len()
+            .saturating_sub(MAX_PENDING_DATA_CHANNEL_SAMPLES);
+        self.data_channel_samples.drain(..excess);
+
+        // A report held for loss evidence can carry an earlier ACK time.
+        let acked_at = self
+            .data_channel_acked_at
+            .map_or(delivery.acked_at, |t| t.max(delivery.acked_at));
+        self.data_channel_acked_at = Some(acked_at);
+        self.data_channel_acked.push(acked_at, delivery.size);
+    }
+
+    /// Data channel throughput acknowledged over the sustained window.
+    fn data_channel_acked_bitrate(&mut self, now: Instant) -> Bitrate {
+        self.data_channel_acked.purge_old(now);
+        self.data_channel_acked.sum() / DATA_CHANNEL_ACKED_WINDOW
+    }
+
+    /// Everything the path acknowledged: RTP from TWCC plus data channels.
+    fn total_acked_bitrate(&mut self, rtp: Option<Bitrate>, now: Instant) -> Option<Bitrate> {
+        let data_channel = self.data_channel_acked_bitrate(now);
+        match rtp {
+            Some(rtp) => Some(rtp + data_channel),
+            None => (data_channel > Bitrate::ZERO).then_some(data_channel),
         }
     }
 
@@ -219,6 +337,7 @@ impl SendSideBandwidthEstimator {
         }
 
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
+        let total_acked_bitrate = self.total_acked_bitrate(acked_bitrate, now);
 
         // Use the latest probe result from this update, if any
         let probe_result = latest_probe_result;
@@ -233,6 +352,15 @@ impl SendSideBandwidthEstimator {
         let Some(delay_estimate) = maybe_estimate else {
             return;
         };
+
+        // Data channel traffic shares the path but not the transport feedback.
+        let mut loss_samples: Vec<LossSample> =
+            send_records.iter().map(|record| (*record).into()).collect();
+        for sample in self.data_channel_samples.drain(..) {
+            count += 1;
+            lost += u32::from(sample.lost);
+            loss_samples.push(sample);
+        }
 
         let loss = if count == 0 {
             0.0
@@ -252,13 +380,15 @@ impl SendSideBandwidthEstimator {
             self.loss_controller.set_bandwidth_estimate(delay_estimate);
         }
 
-        if let Some(acked_bitrate) = acked_bitrate {
+        // The loss controller sees data channel bytes in its sending rate, so
+        // its acknowledged rate must include them too.
+        if let Some(acked_bitrate) = total_acked_bitrate {
             self.loss_controller.set_acknowledged_bitrate(acked_bitrate);
         }
 
         // This corresponds to UpdateLossBasedEstimator + UpdateEstimate
         self.loss_controller
-            .update_bandwidth_estimate(&send_records, delay_estimate);
+            .update_bandwidth_estimate(&loss_samples, delay_estimate);
 
         // Loss-based result is capped by delay_based_limit
         let loss_result = self.loss_controller.loss_based_result();
@@ -482,5 +612,161 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::rtp_::TwccPacketId;
+
+    const ONE_WAY: Duration = Duration::from_millis(20);
+    const FEEDBACK_INTERVAL: Duration = Duration::from_millis(100);
+    const PACKET: usize = 1000;
+
+    /// Drives the estimator with paced RTP that always arrives beside data
+    /// channel chunks, some of which need a retransmission. The senders do
+    /// not follow the estimate, like a policer dropping bursts of a data
+    /// channel that ignores it.
+    struct Sim {
+        bwe: SendSideBandwidthEstimator,
+        now: Instant,
+        seq: u64,
+        rtp: Bitrate,
+        data_channel: Bitrate,
+        /// One lost transmission every this many delivered chunks.
+        loss_every: Option<u64>,
+        chunks: u64,
+        feed_data_channel: bool,
+    }
+
+    impl Sim {
+        fn new(feed_data_channel: bool, loss_every: Option<u64>) -> Self {
+            Sim {
+                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500)),
+                now: Instant::now(),
+                seq: 0,
+                rtp: Bitrate::kbps(600),
+                data_channel: Bitrate::kbps(1000),
+                loss_every,
+                chunks: 0,
+                feed_data_channel,
+            }
+        }
+
+        fn interval(rate: Bitrate) -> Duration {
+            Duration::from_secs_f64(PACKET as f64 * 8.0 / rate.as_f64())
+        }
+
+        fn run(&mut self, duration: Duration) {
+            let end = self.now + duration;
+            while self.now < end {
+                let start = self.now;
+                self.now += FEEDBACK_INTERVAL;
+
+                let mut records = vec![];
+                let mut sent = start;
+                while sent < self.now {
+                    records.push(TwccSendRecord::test_new(
+                        TwccPacketId::new(self.seq),
+                        sent,
+                        PACKET,
+                        sent + 2 * ONE_WAY,
+                        Some(sent + ONE_WAY),
+                    ));
+                    self.seq += 1;
+                    sent += Self::interval(self.rtp);
+                }
+
+                let mut sent = start;
+                while self.feed_data_channel && sent < self.now {
+                    self.chunks += 1;
+                    let lost = self.loss_every.is_some_and(|n| self.chunks % n == 0);
+                    let retransmitted = sent + Duration::from_millis(50);
+                    let last_sent = if lost { retransmitted } else { sent };
+                    self.bwe.on_data_channel_delivery(DataChannelDelivery {
+                        first_sent: sent,
+                        last_sent,
+                        acked_at: last_sent + 2 * ONE_WAY,
+                        size: PACKET.into(),
+                        lost_transmissions: u32::from(lost),
+                    });
+                    sent += Self::interval(self.data_channel);
+                }
+
+                self.bwe.update(records.iter(), self.now);
+                self.bwe.handle_timeout(Bitrate::mbps(5), false, self.now);
+            }
+        }
+
+        fn state(&self) -> LossControllerState {
+            self.bwe.loss_controller.loss_based_result().state
+        }
+
+        fn estimate(&self) -> Bitrate {
+            self.bwe.last_estimate().expect("an estimate")
+        }
+    }
+
+    #[test]
+    fn data_channel_loss_reaches_the_loss_controller() {
+        // Every other chunk loses its first transmission: a third of the
+        // data channel transmissions and a quarter of all bytes sent.
+        let mut blind = Sim::new(false, Some(2));
+        blind.run(Duration::from_secs(8));
+        assert_eq!(blind.state(), LossControllerState::DelayBased);
+        assert!(
+            blind.estimate() >= Bitrate::kbps(2400),
+            "RTP alone shows no loss: {}",
+            blind.estimate()
+        );
+
+        let mut fed = Sim::new(true, Some(2));
+        fed.run(Duration::from_secs(8));
+        assert_eq!(fed.state(), LossControllerState::Decreasing);
+        // 1.6 Mbps leaves the sender while a quarter of it is dropped, so the
+        // estimate falls below the sending rate.
+        assert!(
+            fed.estimate() < Bitrate::kbps(1600),
+            "data channel loss must limit the estimate: {}",
+            fed.estimate()
+        );
+    }
+
+    #[test]
+    fn lossless_data_channel_traffic_keeps_the_estimate() {
+        let mut fed = Sim::new(true, None);
+        fed.run(Duration::from_secs(8));
+        assert_eq!(fed.state(), LossControllerState::DelayBased);
+        assert!(fed.estimate() >= Bitrate::kbps(2400), "{}", fed.estimate());
+    }
+
+    #[test]
+    fn data_channel_acknowledgements_count_toward_sustained_throughput() {
+        let mut fed = Sim::new(true, None);
+        fed.run(Duration::from_secs(3));
+        let now = fed.now;
+        let data_channel = fed.bwe.data_channel_acked_bitrate(now);
+        assert!(
+            data_channel >= Bitrate::kbps(900) && data_channel <= Bitrate::kbps(1100),
+            "{data_channel}"
+        );
+        let total = fed
+            .bwe
+            .total_acked_bitrate(Some(Bitrate::kbps(600)), now)
+            .unwrap();
+        assert_eq!(total, Bitrate::kbps(600) + data_channel);
+
+        // The loss controller's sending rate includes data channel bytes, so
+        // its acknowledged rate must as well.
+        let seen = fed.bwe.loss_controller.acknowledged_bitrate();
+        assert!(seen >= Bitrate::kbps(1450), "{seen}");
+
+        // Acknowledgements leave the window once traffic stops.
+        assert_eq!(
+            fed.bwe
+                .data_channel_acked_bitrate(now + DATA_CHANNEL_ACKED_WINDOW * 2),
+            Bitrate::ZERO
+        );
     }
 }

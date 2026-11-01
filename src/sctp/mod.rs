@@ -7,10 +7,11 @@ use std::panic::UnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sctp_proto::{Association, AssociationHandle, DatagramEvent};
+use sctp_proto::{Association, AssociationHandle, DataDelivery, DatagramEvent};
 use sctp_proto::{Endpoint, EndpointConfig, Stream, StreamEvent, Transmit};
 use sctp_proto::{Event, Payload, PayloadProtocolIdentifier, ServerConfig};
 
+use crate::bwe_::DataChannelDelivery;
 use snap::{b64_encode, webrtc_transport_config};
 
 pub use sctp_proto::Error as ProtoError;
@@ -1149,6 +1150,18 @@ impl RtcSctp {
             (Some(a), Some(r)) => Some(a.min(r)),
             (a, r) => a.or(r),
         }
+    }
+
+    /// Next acknowledged DATA chunk with the transmissions it lost.
+    pub fn poll_data_delivery(&mut self) -> Option<DataChannelDelivery> {
+        let delivery: DataDelivery = self.assoc.as_mut()?.poll_data_delivery()?;
+        Some(DataChannelDelivery {
+            first_sent: delivery.first_sent,
+            last_sent: delivery.last_sent,
+            acked_at: delivery.acked_at,
+            size: delivery.bytes.into(),
+            lost_transmissions: delivery.lost_transmissions,
+        })
     }
 
     pub fn push_back_transmit(&mut self, data: VecDeque<Vec<u8>>) {
