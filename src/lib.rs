@@ -839,6 +839,7 @@ use media::{MediaAdded, MediaChanged, MediaData};
 pub mod change;
 
 mod util;
+use util::value_history::ValueHistory;
 use util::{Soonest, not_happening};
 
 mod session;
@@ -918,6 +919,8 @@ pub struct Rtc {
     last_now: Instant,
     peer_bytes_rx: u64,
     peer_bytes_tx: u64,
+    /// DTLS datagram bytes carrying data channels, over the last second.
+    data_channel_bytes_tx: ValueHistory<u64>,
     change_counter: usize,
     last_timeout_reason: Reason,
     crypto_provider: Arc<crate::crypto::CryptoProvider>,
@@ -1283,6 +1286,7 @@ impl Rtc {
             last_now: start,
             peer_bytes_rx: 0,
             peer_bytes_tx: 0,
+            data_channel_bytes_tx: ValueHistory::default(),
             change_counter: 0,
             last_timeout_reason: Reason::NotHappening,
             crypto_provider,
@@ -1809,9 +1813,17 @@ impl Rtc {
 
         if let Some(send) = &self.send_addr {
             // These can only be sent after we got an ICE connection.
-            let datagram = None
-                .or_else(|| self.dtls.poll_packet())
-                .or_else(|| self.session.poll_datagram(self.last_now));
+            let datagram = match self.dtls.poll_packet() {
+                Some(datagram) => {
+                    // Once connected, DTLS only carries data channels.
+                    if self.dtls_connected {
+                        self.data_channel_bytes_tx
+                            .push(self.last_now, datagram.len() as u64);
+                    }
+                    Some(datagram)
+                }
+                None => self.session.poll_datagram(self.last_now),
+            };
 
             if let Some(contents) = datagram {
                 let t = net::Transmit {
@@ -2127,6 +2139,12 @@ impl Rtc {
         }
 
         Some(Channel::new(sctp_stream_id, self))
+    }
+
+    /// Data channel send rate over the last second, in DTLS datagram bytes.
+    fn data_channel_bitrate(&mut self) -> Bitrate {
+        self.data_channel_bytes_tx.purge_old(self.last_now);
+        Bitrate::bps(self.data_channel_bytes_tx.sum() * 8)
     }
 
     /// Configure the Bandwidth Estimate (BWE) subsystem.

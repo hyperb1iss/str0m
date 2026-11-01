@@ -54,4 +54,17 @@ impl<'a> Bwe<'a> {
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.0.session.reset_bwe(init_bitrate);
     }
+
+    /// Data channel send rate over the last second.
+    ///
+    /// Data channels share the path with media but are neither paced nor
+    /// limited by the bandwidth estimate. The estimate from
+    /// [`Event::EgressBitrateEstimate`][crate::Event::EgressBitrateEstimate]
+    /// covers both, so subtract this rate when allocating media bitrate.
+    ///
+    /// Counts the DTLS datagrams that carry SCTP, retransmissions and
+    /// acknowledgements included, but not UDP and IP headers.
+    pub fn data_channel_bitrate(&mut self) -> Bitrate {
+        self.0.data_channel_bitrate()
+    }
 }
