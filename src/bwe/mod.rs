@@ -540,26 +540,22 @@ impl SendSideBandwidthEstimator {
     }
 
     /// Get the latest estimate.
+    ///
+    /// The loss-based result is the target in every state, capped by the
+    /// delay-based estimate, as libwebrtc's
+    /// `SendSideBandwidthEstimation::UpdateEstimate` takes
+    /// `GetLossBasedResult().bandwidth_estimate` whatever its state and
+    /// `UpdateTargetBitrate` caps it at the delay-based limit
+    /// (send_side_bandwidth_estimation.cc at webrtc 92a030d5, lines 450-455
+    /// and 587-596). The state only says why the result is what it is.
     pub fn last_estimate(&self) -> Option<Bitrate> {
         let delay_estimate = self.delay_controller.last_estimate();
-
-        let loss_result = self.loss_controller.loss_based_result();
-
-        // Only apply loss-based limiting when actively in a loss-limiting state
-        match loss_result.state {
-            LossControllerState::DelayBased => {
-                // Loss controller defers to delay-based estimate
-                delay_estimate
-            }
-            LossControllerState::Decreasing | LossControllerState::Increasing => {
-                // Loss controller is actively limiting or recovering
-                match (delay_estimate, loss_result.bandwidth_estimate) {
-                    (Some(de), Some(le)) => Some(de.min(le)),
-                    (None, le @ Some(_)) => le,
-                    (de @ Some(_), None) => de,
-                    (None, None) => None,
-                }
-            }
+        let loss_estimate = self.loss_controller.loss_based_result().bandwidth_estimate;
+        match (delay_estimate, loss_estimate) {
+            (Some(de), Some(le)) => Some(de.min(le)),
+            (None, le @ Some(_)) => le,
+            (de @ Some(_), None) => de,
+            (None, None) => None,
         }
     }
 
@@ -915,5 +911,164 @@ mod test {
             "a probe on a lossless path raises the estimate: {}",
             fed.estimate()
         );
+    }
+
+    /// Paced RTP over a path that never queues: a token-bucket policer like
+    /// a capped uplink's, or random loss, drops packets and every delivered
+    /// packet sees the same delay, so the delay detector never fires. The
+    /// sender keeps its rate whatever the estimate says.
+    struct PathSim {
+        bwe: SendSideBandwidthEstimator,
+        now: Instant,
+        seq: u64,
+        rtp: Bitrate,
+        /// Policed rate and bucket depth; the bucket starts full.
+        policer: Option<(Bitrate, DataSize)>,
+        tokens: f64,
+        /// Seeded random loss in thousandths.
+        random_loss: Option<(u64, u64)>,
+        sent: u64,
+        lost: u64,
+    }
+
+    impl PathSim {
+        fn new(rtp: Bitrate) -> Self {
+            PathSim {
+                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500)),
+                now: Instant::now(),
+                seq: 0,
+                rtp,
+                policer: None,
+                tokens: 0.0,
+                random_loss: None,
+                sent: 0,
+                lost: 0,
+            }
+        }
+
+        /// One second of burst at the policed rate, as the e2e lab's cap
+        /// profiles configure it.
+        fn policed(mut self, rate: Bitrate) -> Self {
+            let burst = DataSize::from((rate.as_f64() / 8.0) as usize);
+            self.policer = Some((rate, burst));
+            self.tokens = burst.as_bytes_f64();
+            self
+        }
+
+        fn lossy(mut self, seed: u64, permille: u64) -> Self {
+            self.random_loss = Some((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), permille));
+            self
+        }
+
+        /// Whether the path delivers a packet sent `elapsed` after the last.
+        fn delivers(&mut self, elapsed: Duration) -> bool {
+            if let Some((rate, burst)) = self.policer {
+                self.tokens = (self.tokens + rate.as_f64() / 8.0 * elapsed.as_secs_f64())
+                    .min(burst.as_bytes_f64());
+                // The policer charges IP and UDP headers too.
+                let charge = (PACKET + 28) as f64;
+                if self.tokens < charge {
+                    return false;
+                }
+                self.tokens -= charge;
+            }
+            if let Some((state, permille)) = &mut self.random_loss {
+                *state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (*state >> 33) % 1000 < *permille {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn run(&mut self, duration: Duration) {
+            let end = self.now + duration;
+            let interval = Sim::interval(self.rtp);
+            while self.now < end {
+                let start = self.now;
+                self.now += FEEDBACK_INTERVAL;
+                let mut records = vec![];
+                let mut sent = start;
+                while sent < self.now {
+                    let delivered = self.delivers(interval);
+                    self.sent += 1;
+                    self.lost += u64::from(!delivered);
+                    records.push(TwccSendRecord::test_new(
+                        TwccPacketId::new(self.seq),
+                        sent,
+                        PACKET,
+                        sent + 2 * ONE_WAY,
+                        delivered.then_some(sent + ONE_WAY),
+                    ));
+                    self.seq += 1;
+                    sent += interval;
+                }
+                self.bwe.update(records.iter(), self.now);
+                self.bwe.handle_timeout(Bitrate::mbps(5), false, self.now);
+            }
+        }
+
+        fn estimate(&self) -> Bitrate {
+            self.bwe.last_estimate().expect("an estimate")
+        }
+
+        fn delay_estimate(&self) -> Bitrate {
+            self.bwe
+                .delay_controller
+                .last_estimate()
+                .expect("a delay estimate")
+        }
+
+        fn loss_ratio(&self) -> f64 {
+            self.lost as f64 / self.sent as f64
+        }
+    }
+
+    #[test]
+    fn policer_loss_without_delay_growth_lowers_the_estimate() {
+        // 1.25 Mbps into a 1 Mbps policer: once its one second bucket
+        // drains, a fifth of the packets are dropped and none is delayed.
+        let mut sim = PathSim::new(Bitrate::kbps(1250)).policed(Bitrate::mbps(1));
+        // Two seconds after the bucket runs dry the loss controller already
+        // limits the estimate, though not yet from a loss-limited state.
+        sim.run(Duration::from_secs(6));
+        assert!(
+            sim.estimate() < Bitrate::kbps(1250),
+            "the loss-based result must limit the estimate in every state: {}",
+            sim.estimate()
+        );
+        sim.run(Duration::from_secs(6));
+        assert!(sim.loss_ratio() > 0.1, "loss {}", sim.loss_ratio());
+        assert!(
+            sim.delay_estimate() >= Bitrate::kbps(2400),
+            "no queue, so the delay estimate stays put: {}",
+            sim.delay_estimate()
+        );
+        assert!(
+            sim.estimate() < Bitrate::kbps(1250),
+            "the estimate must come down below the sending rate: {}",
+            sim.estimate()
+        );
+    }
+
+    #[test]
+    fn random_loss_does_not_collapse_the_estimate() {
+        for seed in [1, 7, 1_234_567] {
+            let mut sim = PathSim::new(Bitrate::kbps(1500)).lossy(seed, 50);
+            sim.run(Duration::from_secs(12));
+            assert!(
+                (0.03..0.07).contains(&sim.loss_ratio()),
+                "seed {seed}: loss {}",
+                sim.loss_ratio()
+            );
+            assert!(
+                sim.estimate() >= Bitrate::kbps(1500),
+                "seed {seed}: 5% random loss must not pull the estimate below \
+                 the sending rate: {}",
+                sim.estimate()
+            );
+        }
     }
 }
