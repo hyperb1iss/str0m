@@ -234,12 +234,14 @@ fn webrtc_rto_sampled_loss_recovers_ordered_messages_once() {
                 pair.attempts[1] - pair.attempts[0],
                 Duration::from_millis(13)
             );
-            // With that resend lost too, T3-rtx fires at the minimum RTO.
+            // With that resend lost too and nothing sent after it, the quiet
+            // tail is probed two SRTT after the resend instead of waiting
+            // for T3-rtx at the minimum RTO.
             assert_eq!(
-                pair.attempts[2] - pair.attempts[0],
-                Duration::from_millis(400)
+                pair.attempts[2] - pair.attempts[1],
+                Duration::from_millis(20)
             );
-            assert_eq!(pair.timeouts(from), 1);
+            assert_eq!(pair.timeouts(from), 0);
             pair.advance(4000);
             assert_eq!(pair.received[1 - from].len(), 2);
         }
