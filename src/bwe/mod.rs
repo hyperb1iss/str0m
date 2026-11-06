@@ -795,13 +795,15 @@ mod test {
         let mut fed = Sim::new(true, Some(2));
         fed.run(Duration::from_secs(8));
         assert_eq!(fed.state(), LossControllerState::Decreasing);
-        // 1.6 Mbps leaves the sender while a quarter of it is dropped, so the
-        // estimate falls below the sending rate.
+        // 2.1 Mbps leaves the sender, retransmissions included, and a quarter
+        // of it is dropped. The estimate falls below the sending rate, down
+        // to the 1.6 Mbps that gets through.
         assert!(
-            fed.estimate() < Bitrate::kbps(1600),
+            fed.estimate() < Bitrate::kbps(1800),
             "data channel loss must limit the estimate: {}",
             fed.estimate()
         );
+        assert!(fed.estimate() >= Bitrate::kbps(1600), "{}", fed.estimate());
     }
 
     #[test]
@@ -1049,6 +1051,11 @@ mod test {
         assert!(
             sim.estimate() < Bitrate::kbps(1250),
             "the estimate must come down below the sending rate: {}",
+            sim.estimate()
+        );
+        assert!(
+            sim.estimate() >= Bitrate::kbps(800),
+            "and not far below what the policer delivers: {}",
             sim.estimate()
         );
     }
