@@ -1209,6 +1209,10 @@ impl Session {
 
         self.pacer.set_padding_rate(result.padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);
+
+        for stream in self.streams.streams_tx() {
+            stream.set_rtx_rate_limit(current_estimate);
+        }
     }
 
     fn has_active_outgoing_media(&self) -> bool {

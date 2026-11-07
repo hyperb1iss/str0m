@@ -23,7 +23,6 @@ use crate::rtp_::{Pt, Rid, RtcpFb, SenderInfo, SenderReport, Ssrc};
 use crate::rtp_::{SRTP_BLOCK_SIZE, SeqNo};
 use crate::session::PacketReceipt;
 use crate::stats::StatsSnapshot;
-use crate::util::value_history::ValueHistory;
 use crate::util::{InstantExt, already_happened, not_happening};
 
 use super::RtpPacket;
@@ -37,7 +36,9 @@ const MIN_SPURIOUS_PADDING_SIZE: usize = 50;
 
 pub const DEFAULT_RTX_CACHE_DURATION: Duration = Duration::from_secs(3);
 
-pub const DEFAULT_RTX_RATIO_CAP: Option<f32> = Some(0.15f32);
+/// How far back resent bytes count against the rate limit, libwebrtc's
+/// `kRetransmitWindowSizeMs`.
+pub(crate) const RTX_RATE_WINDOW: Duration = Duration::from_millis(500);
 
 /// A recently sampled view of an outgoing stream's send queue.
 ///
@@ -145,8 +146,9 @@ pub struct StreamTx {
     /// sending spurious resends as padding.
     rtx_cache: RtxCache,
 
-    /// Determines retransmitted bytes ratio value to clear queued resends.
-    rtx_ratio_cap: Option<f32>,
+    /// The most this stream may resend, the transport's bandwidth estimate.
+    /// `None` until there is one, or without bandwidth estimation.
+    rtx_rate_limit: Option<Bitrate>,
 
     /// Last time we produced a SR.
     last_sender_report: Instant,
@@ -159,11 +161,8 @@ pub struct StreamTx {
 
     /// Statistics of outgoing data.
     ///
-    /// Stats are use to calculate the rtx ratio also when statistics events are disabled.
+    /// Stats are used for the resend rate limit also when statistics events are disabled.
     stats: StreamTxStats,
-
-    // downsampled rtx ratio (value, last calculation)
-    rtx_ratio: (f32, Instant),
 
     // The _main_ PT to use for padding. This is main PT, since the poll_packet() loop
     // figures out the param.resend() RTX PT using main.
@@ -339,12 +338,11 @@ impl StreamTx {
             padding: 0,
             blank_packet: RtpPacket::blank(),
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
-            rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
+            rtx_rate_limit: None,
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
             stats: StreamTxStats::new(enable_stats),
-            rtx_ratio: (0.0, already_happened()),
             pt_for_padding: None,
             remote_acked_ssrc: false,
             remote_acked_rtx_ssrc: false,
@@ -392,31 +390,15 @@ impl StreamTx {
     ///
     /// This determines how old incoming NACKs we can reply to.
     ///
-    /// `rtx_ratio_cap` determines when to clear queued resends because of too many resends,
-    /// i.e. if `tx_sum / (rtx_sum + tx_sum) > rtx_ratio_cap`. `None` disables this functionality
-    /// so all queued resends will be sent.
-    ///
-    /// The default is 1024 packets over 3 seconds and RTX cache drop ratio of 0.15.
-    pub fn set_rtx_cache(
-        &mut self,
-        max_packets: usize,
-        max_age: Duration,
-        rtx_ratio_cap: Option<f32>,
-    ) {
+    /// The default is 1024 packets over 3 seconds.
+    pub fn set_rtx_cache(&mut self, max_packets: usize, max_age: Duration) {
         // Dump old cache to avoid having to deal with resizing logic inside the cache impl.
         self.rtx_cache = RtxCache::new(max_packets, max_age);
-        if rtx_ratio_cap.is_some() {
-            self.stats
-                .bytes_transmitted
-                .get_or_insert_with(ValueHistory::default);
-            self.stats
-                .bytes_retransmitted
-                .get_or_insert_with(ValueHistory::default);
-        } else {
-            self.stats.bytes_transmitted = None;
-            self.stats.bytes_retransmitted = None;
-        }
-        self.rtx_ratio_cap = rtx_ratio_cap;
+    }
+
+    /// Bound resends by the transport's bandwidth estimate.
+    pub(crate) fn set_rtx_rate_limit(&mut self, limit: Bitrate) {
+        self.rtx_rate_limit = Some(limit);
     }
 
     /// Set whether this stream is unpaced or not.
@@ -765,53 +747,29 @@ impl StreamTx {
         })
     }
 
-    fn rtx_ratio_downsampled(&mut self, now: Instant) -> f32 {
-        assert!(
-            self.stats.bytes_transmitted.is_some(),
-            "rtx_ratio_cap must be enabled"
-        );
-        assert!(
-            self.stats.bytes_retransmitted.is_some(),
-            "rtx_ratio_cap must be enabled"
-        );
-
-        let (value, ts) = self.rtx_ratio;
-        if now - ts < Duration::from_millis(50) {
-            // not worth re-evaluating, return the old value
-            return value;
-        }
-
-        // bytes stats refer to the last second by default
-        self.stats
-            .bytes_transmitted
-            .as_mut()
-            .unwrap()
-            .purge_old(now);
-        self.stats
-            .bytes_retransmitted
-            .as_mut()
-            .unwrap()
-            .purge_old(now);
-
-        let bytes_transmitted = self.stats.bytes_transmitted.as_mut().unwrap().sum();
-        let bytes_retransmitted = self.stats.bytes_retransmitted.as_mut().unwrap().sum();
-        let ratio = bytes_retransmitted as f32 / (bytes_retransmitted + bytes_transmitted) as f32;
-        let ratio = if ratio.is_finite() { ratio } else { 0_f32 };
-        self.rtx_ratio = (ratio, now);
-        ratio
+    /// Whether a resend of `len` bytes stays inside the rate limit, as
+    /// libwebrtc's `RateLimiter::TryUseRate` decides it for retransmissions
+    /// (rate_limiter.cc, fed the target rate in
+    /// rtp_transport_controller_send.cc at m125): resent bytes over
+    /// [`RTX_RATE_WINDOW`] may reach the estimate, and the first resend of a
+    /// window always goes, so a very low rate can still repair a packet.
+    ///
+    /// A share of what was sent cannot stand in for this. A loss burst asks
+    /// for more than any small share within one round trip, and refusing
+    /// the rest until the window slides leaves the receiver stalled on
+    /// packets the path has room for again.
+    fn rtx_rate_allows(&mut self, len: usize, now: Instant) -> bool {
+        let Some(limit) = self.rtx_rate_limit else {
+            return true;
+        };
+        let history = &mut self.stats.bytes_retransmitted;
+        history.purge_old(now);
+        let sent = history.sum();
+        let budget = limit.as_f64() / 8.0 * RTX_RATE_WINDOW.as_secs_f64();
+        sent == 0 || (sent + len as u64) as f64 <= budget
     }
 
     fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
-        if let Some(ratio_cap) = self.rtx_ratio_cap {
-            let ratio = self.rtx_ratio_downsampled(now);
-
-            // If we hit the cap, stop doing resends by clearing those we have queued.
-            if ratio > ratio_cap {
-                self.resends.clear();
-                return None;
-            }
-        }
-
         let seq_no = loop {
             let resend = self.resends.pop_front()?;
 
@@ -827,7 +785,13 @@ impl StreamTx {
             // entry to the self.rtx_cache.
             assert!(pkt.nackable);
 
-            break pkt.seq_no;
+            let seq_no = pkt.seq_no;
+            let len = pkt.payload.len();
+
+            // Over the limit this request goes unanswered; the receiver asks again.
+            if self.rtx_rate_allows(len, now) {
+                break seq_no;
+            }
         };
 
         // Borrow checker gymnastics.
@@ -835,9 +799,7 @@ impl StreamTx {
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, true);
-        if let Some(h) = &mut self.stats.bytes_retransmitted {
-            h.push(now, len);
-        }
+        self.stats.bytes_retransmitted.push(now, len);
 
         let seq_no = self.seq_no_rtx.inc();
 
@@ -860,9 +822,6 @@ impl StreamTx {
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, false);
-        if let Some(h) = &mut self.stats.bytes_transmitted {
-            h.push(now, len)
-        }
 
         let seq_no = pkt.seq_no;
 
@@ -1308,9 +1267,7 @@ impl StreamTx {
         self.pending_request_remb = None;
 
         // Reset all statistics - preserve whether stats tracking is enabled
-        let stats_enabled = self.stats.bytes_transmitted.is_some();
-        self.stats = StreamTxStats::new(stats_enabled);
-        self.rtx_ratio = (0.0, already_happened());
+        self.stats = StreamTxStats::new(self.stats.losses_enabled());
         self.remote_acked_ssrc = false;
 
         // Clear all buffers
@@ -1382,6 +1339,44 @@ mod test {
 
         assert_eq!(snapshot.byte_size, 240);
         assert_eq!(snapshot.packet_count, 1);
+    }
+
+    #[test]
+    fn a_loss_burst_is_answered_up_to_the_estimate() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        // 62.5 KB may go in any 500 ms at 1 Mbps.
+        stream.set_rtx_rate_limit(Bitrate::mbps(1));
+
+        for packet in 0..62 {
+            assert!(stream.rtx_rate_allows(1000, now), "packet {packet}");
+            stream.stats.bytes_retransmitted.push(now, 1000);
+        }
+        assert!(!stream.rtx_rate_allows(1000, now));
+
+        // The window slides and the budget returns.
+        let later = now + RTX_RATE_WINDOW + Duration::from_millis(1);
+        assert!(stream.rtx_rate_allows(1000, later));
+    }
+
+    #[test]
+    fn the_first_resend_of_a_window_passes_at_any_rate() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        stream.set_rtx_rate_limit(Bitrate::kbps(1));
+
+        assert!(stream.rtx_rate_allows(1000, now));
+        stream.stats.bytes_retransmitted.push(now, 1000);
+        assert!(!stream.rtx_rate_allows(1000, now));
+    }
+
+    #[test]
+    fn resends_are_unlimited_without_an_estimate() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        stream.stats.bytes_retransmitted.push(now, 1_000_000);
+
+        assert!(stream.rtx_rate_allows(1000, now));
     }
 
     #[test]

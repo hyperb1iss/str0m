@@ -6,7 +6,7 @@ use crate::stats::{MediaEgressStats, RemoteIngressStats, StatsSnapshot};
 use crate::util::value_history::ValueHistory;
 use crate::util::{InstantExt, calculate_rtt};
 
-use super::MidRid;
+use super::{MidRid, RTX_RATE_WINDOW};
 
 /// Holder of stats.
 #[derive(Debug)]
@@ -38,11 +38,8 @@ pub(crate) struct StreamTxStats {
     /// using the last sent sequence number.
     last_rr: Option<(SeqNo, ReceptionReport)>,
 
-    /// `None` if `rtx_ratio_cap` is `None`.
-    pub bytes_transmitted: Option<ValueHistory<u64>>,
-
-    /// `None` if `rtx_ratio_cap` is `None`.
-    pub bytes_retransmitted: Option<ValueHistory<u64>>,
+    /// Resent bytes inside the rate limit's window.
+    pub bytes_retransmitted: ValueHistory<u64>,
 }
 
 impl StreamTxStats {
@@ -58,9 +55,13 @@ impl StreamTxStats {
             rtt: None,
             losses: Losses::new(enable_stats),
             last_rr: None,
-            bytes_transmitted: Some(Default::default()),
-            bytes_retransmitted: Some(Default::default()),
+            bytes_retransmitted: ValueHistory::new(RTX_RATE_WINDOW),
         }
+    }
+
+    /// Whether loss statistics are kept for stats events.
+    pub fn losses_enabled(&self) -> bool {
+        matches!(self.losses, Losses::Enabled(_))
     }
 
     pub fn update_packet_counts(&mut self, bytes: u64, is_resend: bool) {

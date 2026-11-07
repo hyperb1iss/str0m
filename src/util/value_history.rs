@@ -24,6 +24,16 @@ impl<T: Default> Default for ValueHistory<T> {
     }
 }
 
+impl<T: Default> ValueHistory<T> {
+    /// A history that forgets values older than `max_time`.
+    pub fn new(max_time: Duration) -> Self {
+        Self {
+            max_time,
+            ..Default::default()
+        }
+    }
+}
+
 impl<T> ValueHistory<T>
 where
     T: Copy + AddAssign + SubAssign + Sum,

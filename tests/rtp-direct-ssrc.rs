@@ -234,7 +234,7 @@ pub fn rtp_direct_vp8_patch_survives_rtx() -> Result<(), RtcError> {
     l.direct_api().declare_media(mid, MediaKind::Video);
     l.direct_api()
         .declare_stream_tx(ssrc, Some(ssrc_rtx), mid, None)
-        .set_rtx_cache(32, Duration::from_secs(3), None);
+        .set_rtx_cache(32, Duration::from_secs(3));
 
     r.direct_api().declare_media(mid, MediaKind::Video);
     r.direct_api()

@@ -24,7 +24,7 @@ use crate::{Candidate, IceCreds};
 use str0m_proto::Id;
 
 pub use crate::sdp::{SdpAnswer, SdpOffer};
-use crate::streams::{DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP, Streams};
+use crate::streams::{DEFAULT_RTX_CACHE_DURATION, Streams};
 
 /// Changes to the Rtc via SDP Offer/Answer dance.
 pub struct SdpApi<'a> {
@@ -1038,7 +1038,7 @@ fn ensure_stream_tx(session: &mut Session) {
                 session.send_buffer_video
             };
 
-            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
+            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
         }
     }
 }
@@ -1077,7 +1077,7 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
                 session.send_buffer_video
             };
 
-            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
+            stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
         }
     }
 }

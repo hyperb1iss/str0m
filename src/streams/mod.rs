@@ -29,7 +29,7 @@ mod send;
 mod send_queue;
 mod send_stats;
 
-pub(crate) use send::{DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP};
+pub(crate) use send::{DEFAULT_RTX_CACHE_DURATION, RTX_RATE_WINDOW};
 
 pub(crate) struct StreamTimeoutConfig<'a> {
     pub(crate) codecs: &'a CodecConfig,

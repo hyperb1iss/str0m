@@ -11,7 +11,7 @@ use crate::media::{Media, MediaKind};
 use crate::rtp_::MidRid;
 use crate::rtp_::{Mid, Rid, Ssrc};
 use crate::sctp::{ChannelConfig, SctpInitData};
-use crate::streams::{DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP, StreamRx, StreamTx};
+use crate::streams::{DEFAULT_RTX_CACHE_DURATION, StreamRx, StreamTx};
 
 /// Direct change strategy.
 ///
@@ -353,7 +353,7 @@ impl<'a> DirectApi<'a> {
             self.rtc.session.send_buffer_video
         };
 
-        stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP);
+        stream.set_rtx_cache(size, DEFAULT_RTX_CACHE_DURATION);
 
         stream
     }
