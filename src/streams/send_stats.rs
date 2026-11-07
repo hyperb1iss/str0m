@@ -59,6 +59,11 @@ impl StreamTxStats {
         }
     }
 
+    /// The latest round trip time from a receiver report.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
     /// Whether loss statistics are kept for stats events.
     pub fn losses_enabled(&self) -> bool {
         matches!(self.losses, Losses::Enabled(_))

@@ -478,6 +478,7 @@ impl StreamRx {
             payload,
             vp8_patch: None,
             nackable: false,
+            resent_at: None,
             last_sender_info: self.sender_info.as_ref().map(|l| l.info),
             timestamp: now,
         };

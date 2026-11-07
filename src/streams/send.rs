@@ -40,6 +40,10 @@ pub const DEFAULT_RTX_CACHE_DURATION: Duration = Duration::from_secs(3);
 /// `kRetransmitWindowSizeMs`.
 pub(crate) const RTX_RATE_WINDOW: Duration = Duration::from_millis(500);
 
+/// Added to the round trip time before a packet may be resent again, the
+/// 5 ms of libwebrtc's `RTPSender::OnReceivedNack`.
+const RTX_RTT_MARGIN: Duration = Duration::from_millis(5);
+
 /// A recently sampled view of an outgoing stream's send queue.
 ///
 /// str0m refreshes this information as part of its regular pacer and bandwidth-estimation
@@ -471,6 +475,7 @@ impl StreamTx {
             payload,
             vp8_patch,
             nackable,
+            resent_at: None,
             // The overall idea for str0m is to only drive time forward from handle_input. If we
             // used a "now" argument to write_rtp(), we effectively get a second point that also need
             // to move time forward _for all of Rtc_ – that's too complicated.
@@ -796,6 +801,7 @@ impl StreamTx {
 
         // Borrow checker gymnastics.
         let pkt = self.rtx_cache.get_cached_packet_by_seq_no(seq_no).unwrap();
+        pkt.resent_at = Some(now);
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, true);
@@ -960,12 +966,24 @@ impl StreamTx {
         let seq_no = self.rtx_cache.last_cached_seq_no()?;
         let iter = entries.flat_map(|n| n.into_iter(seq_no));
 
+        // A resend younger than a round trip is still in the pipe, so a NACK
+        // for it asks for a duplicate: libwebrtc's `RtpPacketHistory::VerifyRtt`
+        // ignores those, and `GetPacketAndMarkAsPending` one already queued.
+        let min_resend_gap = self.stats.rtt().unwrap_or(Duration::ZERO) + RTX_RTT_MARGIN;
+
         // Schedule all resends. They will be handled on next poll_packet
         for seq_no in iter {
             let Some(packet) = self.rtx_cache.get_cached_packet_by_seq_no(seq_no) else {
                 // Packet was not available in RTX cache, it has probably expired.
                 continue;
             };
+
+            let in_flight = packet
+                .resent_at
+                .is_some_and(|at| now.saturating_duration_since(at) < min_resend_gap);
+            if in_flight || self.resends.iter().any(|r| r.seq_no == seq_no) {
+                continue;
+            }
 
             let resend = Resend {
                 seq_no,
@@ -1339,6 +1357,63 @@ mod test {
 
         assert_eq!(snapshot.byte_size, 240);
         assert_eq!(snapshot.packet_count, 1);
+    }
+
+    fn nacked_stream(now: Instant) -> StreamTx {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        stream.rtx_cache.cache_sent_packet(
+            RtpPacket {
+                seq_no: 5.into(),
+                time: MediaTime::from_90khz(0),
+                header: RtpHeader::default(),
+                payload: vec![0; 100].into(),
+                vp8_patch: None,
+                nackable: true,
+                resent_at: None,
+                last_sender_info: None,
+                timestamp: now,
+            },
+            now,
+        );
+        stream
+    }
+
+    fn nack_for_5() -> std::iter::Once<NackEntry> {
+        std::iter::once(NackEntry {
+            pid: 5,
+            blp: 0,
+        })
+    }
+
+    #[test]
+    fn a_queued_resend_is_not_queued_twice() {
+        let now = Instant::now();
+        let mut stream = nacked_stream(now);
+
+        stream.handle_nack(nack_for_5(), now);
+        stream.handle_nack(nack_for_5(), now);
+
+        assert_eq!(stream.resends.len(), 1);
+    }
+
+    #[test]
+    fn a_resend_gets_a_round_trip_before_it_is_resent() {
+        let now = Instant::now();
+        let mut stream = nacked_stream(now);
+
+        stream.handle_nack(nack_for_5(), now);
+        assert!(stream.poll_packet_resend(now).is_some());
+        assert!(stream.resends.is_empty());
+
+        // Still in the pipe: no round trip is known, so only the margin.
+        let soon = now + RTX_RTT_MARGIN - Duration::from_millis(1);
+        stream.handle_nack(nack_for_5(), soon);
+        assert!(stream.resends.is_empty());
+
+        // Lost, then: the receiver asked again a round trip later.
+        let later = now + RTX_RTT_MARGIN;
+        stream.handle_nack(nack_for_5(), later);
+        assert_eq!(stream.resends.len(), 1);
     }
 
     #[test]

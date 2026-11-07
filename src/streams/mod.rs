@@ -75,6 +75,9 @@ pub struct RtpPacket {
     /// This is often false for audio, but might also be false for discardable frames when
     /// using temporal encoding as in a VP8 simulcast situation.
     pub(crate) nackable: bool,
+
+    /// When this packet was last resent, for outgoing packets.
+    pub(crate) resent_at: Option<Instant>,
 }
 
 /// Event when an encoded stream is considered paused/unpaused.
@@ -110,6 +113,7 @@ impl RtpPacket {
             payload: Arc::default(), // This payload is never used. See RtpHeader::create_padding_packet
             vp8_patch: None,
             nackable: false,
+            resent_at: None,
             last_sender_info: None,
             timestamp: already_happened(),
         }

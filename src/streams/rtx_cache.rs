@@ -94,6 +94,7 @@ mod test {
             timestamp: after(now, millis),
             last_sender_info: None,
             nackable: true,
+            resent_at: None,
         }
     }
 
