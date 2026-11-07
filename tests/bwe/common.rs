@@ -74,6 +74,8 @@ pub struct BweTestContext {
     media_send_rate: Bitrate,
     /// Accumulated byte budget for sending (smooths out timing variations)
     byte_budget: f64,
+    /// The estimates [`Step::Record`] kept, in plan order.
+    pub estimates: Vec<Bitrate>,
 }
 
 #[derive(Clone)]
@@ -99,6 +101,8 @@ pub enum Step {
         description: &'static str,
         at_least: Bitrate,
     },
+    /// Keep the latest BWE estimate in [`BweTestContext::estimates`]
+    Record { description: &'static str },
     CheckProbe {
         description: &'static str,
         check: Arc<dyn Fn(usize, &ProbeClusterConfig) -> bool>,
@@ -141,6 +145,7 @@ impl BweTestContext {
             seq_no: 47_000,
             media_send_rate: Bitrate::mbps(2), // Default to 2 Mbps
             byte_budget: 0.0,
+            estimates: Vec::new(),
         }
     }
 
@@ -207,6 +212,17 @@ impl BweTestContext {
                         *at_least
                     );
                     // Check does not reset event offset.
+                }
+                Step::Record { description } => {
+                    let estimate = get_last_bwe_estimate(l).expect("a BWE estimate");
+                    info!(
+                        "{}/{}: Record estimate: {} ({})",
+                        no + 1,
+                        total,
+                        description,
+                        estimate
+                    );
+                    self.estimates.push(estimate);
                 }
                 Step::CheckProbe { description, check } => {
                     info!("{}/{}: Check probe: {}", no + 1, total, description);
