@@ -549,7 +549,24 @@ impl ProbeControl {
     fn queue_probe(&mut self, bitrate: Bitrate, kind: ProbeKind, desired: Bitrate, now: Instant) {
         // Cap at 2× desired bitrate.
         let max = desired * MAX_PROBE_BITRATE_FACTOR;
-        let bitrate = bitrate.min(max);
+
+        // WebRTC `InitiateProbing`: every probe out of a loss limited state
+        // stays near the estimate, and one that the cap shortens ends the
+        // ladder. Loss found the limit; a probe far above it says nothing
+        // the loss did not, and on a token bucket it passes anyway. Stagnant
+        // probes are str0m's own way out of that state, so they stay at
+        // their rate.
+        let loss_limited = self.last_cause == BandwidthLimitedCause::LossLimitedBweIncreasing;
+        let loss_limit = (loss_limited && kind != ProbeKind::Stagnant)
+            .then_some(self.last_estimate)
+            .flatten()
+            .map(|estimate| estimate * self.config.loss_limited_probe_scale)
+            .filter(|limit| bitrate >= *limit);
+        let probe_further_allowed = loss_limit.is_none();
+
+        let bitrate = bitrate
+            .min(max)
+            .min(loss_limit.unwrap_or(Bitrate::INFINITY));
 
         // No probe at too small values.
         if bitrate < Bitrate::kbps(5) {
@@ -564,7 +581,11 @@ impl ProbeControl {
             .with_min_probe_delta(self.config.min_probe_delta);
 
         // Threshold for further exponential probing (probe_bitrate * 0.7).
-        let probe_further = bitrate * self.config.further_probe_threshold;
+        let probe_further = if probe_further_allowed {
+            bitrate * self.config.further_probe_threshold
+        } else {
+            Bitrate::INFINITY
+        };
 
         self.pending.push_back(config);
         self.last_probe = Some(LastProbe {
@@ -765,6 +786,32 @@ mod test {
 
         let p = pc.handle_timeout(now + Duration::from_millis(10)).unwrap();
         assert_eq!(p.target_bitrate(), Bitrate::mbps(10));
+    }
+
+    #[test]
+    fn a_loss_limited_estimate_holds_every_probe_near_it() {
+        let mut pc = ProbeControl::new(false);
+        pc.enable(true);
+        let start = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(800),
+            BandwidthLimitedCause::LossLimitedBweIncreasing,
+        );
+
+        // The initial probes would be 2.4 and 4.8 Mbps.
+        let first = pc.handle_timeout(start).unwrap();
+        let second = pc.handle_timeout(start).unwrap();
+        assert_eq!(first.target_bitrate(), Bitrate::kbps(1_200));
+        assert_eq!(second.target_bitrate(), Bitrate::kbps(1_200));
+
+        // The cap ended the ladder, whatever the estimate does next.
+        pc.set_estimated_bitrate(
+            Bitrate::mbps(3),
+            BandwidthLimitedCause::LossLimitedBweIncreasing,
+        );
+        assert!(pc.handle_timeout(start + Duration::from_secs(2)).is_none());
     }
 
     #[test]
