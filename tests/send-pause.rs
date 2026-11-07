@@ -48,7 +48,9 @@ fn vp8_sample(size: usize, keyframe: bool, marker: u8) -> Vec<u8> {
 
 fn connect(initial: Bitrate, desired: Bitrate) -> Result<Pair, RtcError> {
     let mut l = TestRtc::new_with_config(Peer::Left, |c| {
-        c.enable_bwe(Some(initial)).enable_raw_packets(true)
+        c.enable_bwe(Some(initial))
+            .set_bwe_periodic_probing(true)
+            .enable_raw_packets(true)
     });
     let mut r = TestRtc::new(Peer::Right);
 

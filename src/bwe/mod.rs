@@ -123,8 +123,8 @@ pub struct Bwe {
 }
 
 impl Bwe {
-    pub fn new(initial: Bitrate) -> Self {
-        let send_side_bwe = SendSideBandwidthEstimator::new(initial);
+    pub fn new(initial: Bitrate, periodic_probing: bool) -> Self {
+        let send_side_bwe = SendSideBandwidthEstimator::new(initial, periodic_probing);
         Bwe {
             bwe: send_side_bwe,
             desired_bitrate: Bitrate::ZERO,
@@ -210,10 +210,12 @@ struct SendSideBandwidthEstimator {
     data_channel_acked_at: Option<Instant>,
     /// When feedback last reported a lost packet, RTP or data channel.
     last_loss_at: Option<Instant>,
+    /// Whether the probe control probes on its timers.
+    periodic_probing: bool,
 }
 
 impl SendSideBandwidthEstimator {
-    pub fn new(initial_bitrate: Bitrate) -> Self {
+    pub fn new(initial_bitrate: Bitrate, periodic_probing: bool) -> Self {
         let mut alr_detector = AlrDetector::new();
         alr_detector.set_estimated_bitrate(initial_bitrate);
 
@@ -227,7 +229,7 @@ impl SendSideBandwidthEstimator {
                 INITIAL_BITRATE_WINDOW,
                 BITRATE_WINDOW,
             ),
-            probe_control: ProbeControl::new(),
+            probe_control: ProbeControl::new(periodic_probing),
             probe_estimator: ProbeEstimator::new(),
             started_at: None,
             alr_detector,
@@ -237,6 +239,7 @@ impl SendSideBandwidthEstimator {
             data_channel_acked: ValueHistory::default(),
             data_channel_acked_at: None,
             last_loss_at: None,
+            periodic_probing,
         }
     }
 
@@ -578,7 +581,7 @@ impl SendSideBandwidthEstimator {
     }
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
-        *self = Self::new(init_bitrate);
+        *self = Self::new(init_bitrate, self.periodic_probing);
     }
 }
 
@@ -690,7 +693,7 @@ mod test {
     impl Sim {
         fn new(feed_data_channel: bool, loss_every: Option<u64>) -> Self {
             Sim {
-                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500)),
+                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500), true),
                 now: Instant::now(),
                 seq: 0,
                 rtp: Bitrate::kbps(600),
@@ -816,7 +819,7 @@ mod test {
 
     #[test]
     fn data_channel_history_stays_bounded_without_transport_feedback() {
-        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::kbps(2500));
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::kbps(2500), true);
         let start = Instant::now();
         // Ten seconds of data channel deliveries at 100 per second, with no
         // TWCC report to drive `update`.
@@ -936,7 +939,7 @@ mod test {
     impl PathSim {
         fn new(rtp: Bitrate) -> Self {
             PathSim {
-                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500)),
+                bwe: SendSideBandwidthEstimator::new(Bitrate::kbps(2500), true),
                 now: Instant::now(),
                 seq: 0,
                 rtp,

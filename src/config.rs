@@ -31,6 +31,7 @@ use crate::rtp_::{Bitrate, Extension, ExtensionMap};
 /// Configs implement [`Clone`] to help create multiple `Rtc` instances.
 #[derive(Debug, Clone)]
 pub struct RtcConfig {
+    pub(crate) bwe_periodic_probing: bool,
     pub(crate) local_ice_credentials: Option<IceCreds>,
     pub(crate) crypto_provider: Option<Arc<CryptoProvider>>,
     pub(crate) dtls_cert: Option<DtlsCert>,
@@ -453,6 +454,23 @@ impl RtcConfig {
         self
     }
 
+    /// Whether bandwidth estimation probes on timers, without a change of
+    /// estimate or desired bitrate: every 5 seconds while application
+    /// limited, and when the estimate has stagnated below the desired
+    /// bitrate.
+    ///
+    /// Off by default, as in libwebrtc, where a stream has to ask for it
+    /// (`EnablePeriodicAlrProbing`) and a camera does not. A sender that
+    /// switches between fixed layers wants this to find room for the next
+    /// layer before it sends it. A sender whose encoder rises with the
+    /// estimate does not: the estimate follows what it sends, and a probe
+    /// that fits through a token bucket raises the estimate past a rate the
+    /// path cannot sustain.
+    pub fn set_bwe_periodic_probing(mut self, enabled: bool) -> Self {
+        self.bwe_periodic_probing = enabled;
+        self
+    }
+
     /// The initial bitrate as set by [`Self::enable_bwe()`].
     ///
     /// ```
@@ -750,6 +768,7 @@ impl BweConfig {
 impl Default for RtcConfig {
     fn default() -> Self {
         Self {
+            bwe_periodic_probing: false,
             local_ice_credentials: None,
             crypto_provider: None,
             dtls_cert: None,

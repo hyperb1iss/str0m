@@ -56,6 +56,14 @@ pub struct ProbeControl {
     config: Config,
     next_timeout: Instant,
     enabled: bool,
+    /// Whether the timers probe without a change of estimate or allocation.
+    /// WebRTC: `enable_periodic_alr_probing_`, false unless a stream asks for
+    /// it (probe_controller.cc constructor and `TimeForAlrProbe`,
+    /// `requests_alr_probing` in goog_cc_network_control.cc). A camera in
+    /// Chrome never asks: an application-limited sender has no use for
+    /// capacity above what it sends, and a short probe proves nothing about
+    /// a sustained rate on a path with a token bucket.
+    periodic: bool,
 
     desired_bitrate: Option<Bitrate>,
     prev_desired: Option<Bitrate>,
@@ -101,6 +109,7 @@ impl Default for ProbeControl {
         Self {
             config: Config::default(),
             enabled: false,
+            periodic: false,
             next_timeout: not_happening(),
             desired_bitrate: None,
             prev_desired: None,
@@ -123,8 +132,11 @@ impl Default for ProbeControl {
 }
 
 impl ProbeControl {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(periodic: bool) -> Self {
+        Self {
+            periodic,
+            ..Self::default()
+        }
     }
 
     pub fn enable(&mut self, v: bool) {
@@ -372,6 +384,10 @@ impl ProbeControl {
     }
 
     fn maybe_periodic_alr(&mut self, now: Instant, desired: Bitrate) -> bool {
+        if !self.periodic {
+            return false;
+        }
+
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
             return false;
@@ -441,6 +457,10 @@ impl ProbeControl {
     /// - Uses a conservative 15-second wait to avoid probing at convergence
     /// - Rate-limited to once per 30 seconds to prevent oscillation
     fn maybe_stagnant(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
+        if !self.periodic {
+            return false;
+        }
+
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
             return false;
@@ -565,6 +585,10 @@ impl ProbeControl {
                 }
                 return self.scheduled_exponential.unwrap();
             }
+        }
+
+        if !self.periodic {
+            return not_happening();
         }
 
         // ALR periodic probing
@@ -695,7 +719,7 @@ mod test {
 
     #[test]
     fn initial_exponential_probes_are_queued_and_emitted_one_per_tick() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -723,7 +747,7 @@ mod test {
 
     #[test]
     fn further_probe_is_triggered_when_probe_result_is_high_enough() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -744,8 +768,38 @@ mod test {
     }
 
     #[test]
+    fn timers_do_not_probe_unless_asked_to() {
+        let mut pc = ProbeControl::new(false);
+        pc.enable(true);
+        let start = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(1));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        pc.set_alr_start_time(start);
+
+        // Drain initial probes.
+        let _ = pc.handle_timeout(start).unwrap();
+        let _ = pc.handle_timeout(start).unwrap();
+
+        // Application limited for a minute, then a minute above the limit
+        // with the desired bitrate out of reach.
+        for second in 1..=60 {
+            let now = start + Duration::from_secs(second);
+            pc.set_desired_bitrate(Bitrate::mbps(1));
+            assert!(pc.handle_timeout(now).is_none(), "in ALR at {second} s");
+        }
+        pc.set_alr_stop_time(start + Duration::from_secs(61));
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        for second in 62..=120 {
+            let now = start + Duration::from_secs(second);
+            pc.set_desired_bitrate(Bitrate::mbps(5));
+            assert!(pc.handle_timeout(now).is_none(), "stagnant at {second} s");
+        }
+    }
+
+    #[test]
     fn allocation_probe_is_triggered_in_alr_when_allocation_increases() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -775,7 +829,7 @@ mod test {
 
     #[test]
     fn handles_bitrate_infinity_without_panic() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -790,7 +844,7 @@ mod test {
 
     #[test]
     fn handles_clock_skew_gracefully() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -813,7 +867,7 @@ mod test {
 
     #[test]
     fn handles_max_bitrate_zero() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -829,7 +883,7 @@ mod test {
 
     #[test]
     fn allocation_probe_fires_when_desired_increases_in_alr() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -862,7 +916,7 @@ mod test {
 
     #[test]
     fn large_drop_probing_after_alr_ended() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -898,7 +952,7 @@ mod test {
 
     #[test]
     fn allocation_probe_requires_desired_increase_in_alr() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -935,7 +989,7 @@ mod test {
 
     #[test]
     fn periodic_alr_probing() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 
@@ -966,7 +1020,7 @@ mod test {
 
     #[test]
     fn periodic_alr_probing_continues_even_when_estimate_reaches_max() {
-        let mut pc = ProbeControl::new();
+        let mut pc = ProbeControl::new(true);
         pc.enable(true);
         let now = Instant::now();
 

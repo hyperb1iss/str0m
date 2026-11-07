@@ -27,6 +27,7 @@ pub fn connect_with_bwe(initial_bitrate: Bitrate, desired_bitrate: Bitrate) -> (
     let rtc1 = Rtc::builder()
         .set_rtp_mode(true)
         .enable_bwe(Some(initial_bitrate))
+        .set_bwe_periodic_probing(true)
         .build(start);
 
     let rtc2 = Rtc::builder().set_rtp_mode(true).build(start);
