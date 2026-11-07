@@ -999,6 +999,7 @@ impl Session {
 
         let buf = &mut self.poll_packet_buf;
         let twcc_seq = self.twcc;
+        let rtx_rate_limit = self.bwe.as_ref().and_then(|bwe| bwe.last_estimate());
 
         let stream = self.streams.stream_tx_by_midrid(midrid)?;
 
@@ -1010,7 +1011,7 @@ impl Session {
         let twcc_enabled = exts.id_of(Extension::TransportSequenceNumber).is_some();
         let twcc = twcc_enabled.then_some(&mut self.twcc);
 
-        let receipt = stream.poll_packet(now, exts, twcc, params, buf)?;
+        let receipt = stream.poll_packet(now, exts, twcc, params, buf, rtx_rate_limit)?;
 
         let PacketReceipt {
             header,
@@ -1209,10 +1210,6 @@ impl Session {
 
         self.pacer.set_padding_rate(result.padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);
-
-        for stream in self.streams.streams_tx() {
-            stream.set_rtx_rate_limit(current_estimate);
-        }
     }
 
     fn has_active_outgoing_media(&self) -> bool {

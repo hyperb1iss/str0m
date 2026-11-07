@@ -150,10 +150,6 @@ pub struct StreamTx {
     /// sending spurious resends as padding.
     rtx_cache: RtxCache,
 
-    /// The most this stream may resend, the transport's bandwidth estimate.
-    /// `None` until there is one, or without bandwidth estimation.
-    rtx_rate_limit: Option<Bitrate>,
-
     /// Last time we produced a SR.
     last_sender_report: Instant,
 
@@ -342,7 +338,6 @@ impl StreamTx {
             padding: 0,
             blank_packet: RtpPacket::blank(),
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
-            rtx_rate_limit: None,
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
@@ -398,11 +393,6 @@ impl StreamTx {
     pub fn set_rtx_cache(&mut self, max_packets: usize, max_age: Duration) {
         // Dump old cache to avoid having to deal with resizing logic inside the cache impl.
         self.rtx_cache = RtxCache::new(max_packets, max_age);
-    }
-
-    /// Bound resends by the transport's bandwidth estimate.
-    pub(crate) fn set_rtx_rate_limit(&mut self, limit: Bitrate) {
-        self.rtx_rate_limit = Some(limit);
     }
 
     /// Set whether this stream is unpaced or not.
@@ -503,6 +493,7 @@ impl StreamTx {
         twcc: Option<&mut u64>,
         params: &[PayloadParams],
         buf: &mut Vec<u8>,
+        rtx_rate_limit: Option<Bitrate>,
     ) -> Option<PacketReceipt> {
         let mid = self.midrid.mid();
         let rid = self.midrid.rid();
@@ -515,7 +506,7 @@ impl StreamTx {
         }
         let padding_allowed = self.send_gate == SendGate::Open;
 
-        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now) {
+        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now, rtx_rate_limit) {
             (next, false)
         } else if let Some(next) = self.poll_packet_regular(now) {
             (next, false)
@@ -752,19 +743,20 @@ impl StreamTx {
         })
     }
 
-    /// Whether a resend of `len` bytes stays inside the rate limit, as
-    /// libwebrtc's `RateLimiter::TryUseRate` decides it for retransmissions
-    /// (rate_limiter.cc, fed the target rate in
+    /// Whether a resend of `len` bytes stays inside `limit`, the transport's
+    /// bandwidth estimate, as libwebrtc's `RateLimiter::TryUseRate` decides
+    /// it for retransmissions (rate_limiter.cc, fed the target rate in
     /// rtp_transport_controller_send.cc at m125): resent bytes over
     /// [`RTX_RATE_WINDOW`] may reach the estimate, and the first resend of a
     /// window always goes, so a very low rate can still repair a packet.
+    /// Without an estimate nothing limits resends.
     ///
     /// A share of what was sent cannot stand in for this. A loss burst asks
     /// for more than any small share within one round trip, and refusing
     /// the rest until the window slides leaves the receiver stalled on
     /// packets the path has room for again.
-    fn rtx_rate_allows(&mut self, len: usize, now: Instant) -> bool {
-        let Some(limit) = self.rtx_rate_limit else {
+    fn rtx_rate_allows(&mut self, len: usize, now: Instant, limit: Option<Bitrate>) -> bool {
+        let Some(limit) = limit else {
             return true;
         };
         let history = &mut self.stats.bytes_retransmitted;
@@ -774,7 +766,11 @@ impl StreamTx {
         sent == 0 || (sent + len as u64) as f64 <= budget
     }
 
-    fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
+    fn poll_packet_resend(
+        &mut self,
+        now: Instant,
+        limit: Option<Bitrate>,
+    ) -> Option<NextPacket<'_>> {
         let seq_no = loop {
             let resend = self.resends.pop_front()?;
 
@@ -794,7 +790,7 @@ impl StreamTx {
             let len = pkt.payload.len();
 
             // Over the limit this request goes unanswered; the receiver asks again.
-            if self.rtx_rate_allows(len, now) {
+            if self.rtx_rate_allows(len, now, limit) {
                 break seq_no;
             }
         };
@@ -805,7 +801,7 @@ impl StreamTx {
 
         let len = pkt.payload.len() as u64;
         self.stats.update_packet_counts(len, true);
-        self.stats.bytes_retransmitted.push(now, len);
+        self.stats.bytes_retransmitted.push_recent(now, len);
 
         let seq_no = self.seq_no_rtx.inc();
 
@@ -1379,10 +1375,7 @@ mod test {
     }
 
     fn nack_for_5() -> std::iter::Once<NackEntry> {
-        std::iter::once(NackEntry {
-            pid: 5,
-            blp: 0,
-        })
+        std::iter::once(NackEntry { pid: 5, blp: 0 })
     }
 
     #[test]
@@ -1402,7 +1395,7 @@ mod test {
         let mut stream = nacked_stream(now);
 
         stream.handle_nack(nack_for_5(), now);
-        assert!(stream.poll_packet_resend(now).is_some());
+        assert!(stream.poll_packet_resend(now, None).is_some());
         assert!(stream.resends.is_empty());
 
         // Still in the pipe: no round trip is known, so only the margin.
@@ -1421,37 +1414,47 @@ mod test {
         let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
         let now = Instant::now();
         // 62.5 KB may go in any 500 ms at 1 Mbps.
-        stream.set_rtx_rate_limit(Bitrate::mbps(1));
+        let limit = Some(Bitrate::mbps(1));
 
         for packet in 0..62 {
-            assert!(stream.rtx_rate_allows(1000, now), "packet {packet}");
+            assert!(stream.rtx_rate_allows(1000, now, limit), "packet {packet}");
             stream.stats.bytes_retransmitted.push(now, 1000);
         }
-        assert!(!stream.rtx_rate_allows(1000, now));
+        assert!(!stream.rtx_rate_allows(1000, now, limit));
 
         // The window slides and the budget returns.
         let later = now + RTX_RATE_WINDOW + Duration::from_millis(1);
-        assert!(stream.rtx_rate_allows(1000, later));
+        assert!(stream.rtx_rate_allows(1000, later, limit));
     }
 
     #[test]
     fn the_first_resend_of_a_window_passes_at_any_rate() {
         let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
         let now = Instant::now();
-        stream.set_rtx_rate_limit(Bitrate::kbps(1));
+        let limit = Some(Bitrate::kbps(1));
 
-        assert!(stream.rtx_rate_allows(1000, now));
+        assert!(stream.rtx_rate_allows(1000, now, limit));
         stream.stats.bytes_retransmitted.push(now, 1000);
-        assert!(!stream.rtx_rate_allows(1000, now));
+        assert!(!stream.rtx_rate_allows(1000, now, limit));
     }
 
     #[test]
-    fn resends_are_unlimited_without_an_estimate() {
-        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+    fn resends_are_unlimited_without_an_estimate_and_their_history_stays_bounded() {
         let now = Instant::now();
-        stream.stats.bytes_retransmitted.push(now, 1_000_000);
+        let mut stream = nacked_stream(now);
 
-        assert!(stream.rtx_rate_allows(1000, now));
+        // Twenty windows of resends with no estimate to limit them.
+        for window in 0..20u32 {
+            let at = now + RTX_RATE_WINDOW * window;
+            stream.handle_nack(nack_for_5(), at + RTX_RTT_MARGIN);
+            assert!(
+                stream
+                    .poll_packet_resend(at + RTX_RTT_MARGIN, None)
+                    .is_some()
+            );
+        }
+
+        assert!(stream.stats.bytes_retransmitted.history_len() <= 2);
     }
 
     #[test]
